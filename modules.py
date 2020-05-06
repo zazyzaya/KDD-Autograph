@@ -9,11 +9,10 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.nn import Linear
-from torch_geometric.nn import GCNConv, JumpingKnowledge, Node2Vec
+from torch_geometric.nn import GCNConv, SAGEConv, JumpingKnowledge, Node2Vec
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
 
-from graph_utils import graph_data
 from math import log 
 
 '''
@@ -49,12 +48,43 @@ class GCN(torch.nn.Module):
     def __repr__(self):
         return self.__class__.__name__
 
+
+class GraphSAGE(torch.nn.Module):
+    def __init__(self, num_layers=2, hidden=16,  features_num=16, num_class=2):
+        super().__init__()
+        self.sage1 = SAGEConv(features_num, hidden)
+        self.convs = torch.nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.convs.append(SAGEConv(hidden, hidden))
+        self.lin2 = Linear(hidden, num_class)
+
+    def reset_parameters(self):
+        self.first_lin.reset_parameters()
+        self.sage1.reset_parameters()
+        for conv in self.convs:
+            conv.reset_parameters()
+        self.lin2.reset_parameters()
+
+    def forward(self, data):
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
+        x = F.relu(self.sage1(x, edge_index, edge_weight=edge_weight))
+        x = F.dropout(x, p=0.5, training=self.training)
+        for conv in self.convs:
+            x = F.relu(conv(x, edge_index, edge_weight=edge_weight))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.lin2(x)
+        return F.log_softmax(x, dim=-1)
+
+    def __repr__(self):
+        return self.__class__.__name__
+
+
 '''
 Adds node2vec embeddings to node features (concatenates them)
 '''
 class GCN_Plus_N2V(GCN):
     def __init__(self, num_nodes, embedding_dim=16, walk_length=5, context_size=5, 
-                 walks_per_node=1, num_layers=2, hidden=64,  features_num=16, num_class=2):
+                 walks_per_node=1, num_layers=2, hidden=32,  features_num=16, num_class=2):
         super().__init__(num_layers, hidden, features_num+embedding_dim, num_class)
         
         self.n2v = Node2Vec(
@@ -76,7 +106,7 @@ class GCN_Plus_N2V(GCN):
             loss.backward()
             optimizer.step()
             
-            print("[%d] loss: %.3f" %(epoch, loss.item()))
+            #print("[%d] loss: %.3f" %(epoch, loss.item()))
             if loss.item() <= min_loss:
                 break
         
@@ -106,7 +136,7 @@ just treats them as vectors with no other information
 '''
 class N2V_Plus_Features(GCN_Plus_N2V):
     def __init__(self, num_nodes, embedding_dim=16, walk_length=5, context_size=5, 
-                 walks_per_node=1, num_layers=2, hidden=64, features_num=16, num_class=2):
+                 walks_per_node=1, num_layers=2, hidden=32, features_num=16, num_class=2):
         
         super().__init__(num_nodes, embedding_dim, walk_length, context_size, 
                  walks_per_node, num_layers, hidden,  features_num, num_class)
@@ -114,7 +144,7 @@ class N2V_Plus_Features(GCN_Plus_N2V):
         self.first_lin = Linear(features_num+embedding_dim, hidden)
         self.hidden_layers = torch.nn.ModuleList()
         for i in range(num_layers - 1):
-            self.convs.append(Linear(hidden, hidden))
+            self.hidden_layers.append(Linear(hidden, hidden))
         
         self.last_lin = Linear(hidden, num_class)
 
@@ -128,6 +158,36 @@ class N2V_Plus_Features(GCN_Plus_N2V):
     def forward(self, data):
         x = data.x 
         x = torch.cat((x, self.n2v.embedding.weight), dim=1)
+        
+        x = F.relu(self.first_lin(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        for l in self.hidden_layers:
+            x = F.relu(l(x))
+        
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.last_lin(x)
+        return F.log_softmax(x, dim=-1)
+    
+
+class JustFeaturesModule(torch.nn.Module):
+    def __init__(self, num_layers=2, hidden=16, features_num=16, num_class=2):
+        super().__init__()
+        
+        self.first_lin = Linear(features_num, hidden)
+        self.hidden_layers = torch.nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.hidden_layers.append(Linear(hidden, hidden))
+        
+        self.last_lin = Linear(hidden, num_class)
+    
+    def reset_parameters(self):
+        self.first_lin.reset_parameters()
+        for l in self.hidden_layers:
+            l.reset_parameters()
+        self.last_lin.reset_parameters()
+        
+    def forward(self, data):
+        x = data.x 
         
         x = F.relu(self.first_lin(x))
         x = F.dropout(x, p=0.5, training=self.training)

@@ -13,7 +13,7 @@ from torch_geometric.nn import GCNConv, JumpingKnowledge, Node2Vec
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
 
-from graph_utils import graph_data
+from graph_utils import pre_process_feats, pre_process_edge_weights
 from math import log 
 
 from modules import * 
@@ -27,6 +27,8 @@ class OGModel:
 
     def generate_pyg_data(self, data):
         x = data['fea_table']
+        x = pre_process_feats(x)
+        
         if x.shape[1] == 1:
             x = x.to_numpy()
             x = x.reshape(x.shape[0])
@@ -43,6 +45,16 @@ class OGModel:
 
         edge_weight = df['edge_weight'].to_numpy()
         edge_weight = torch.tensor(edge_weight, dtype=torch.float32)
+        
+        print(edge_weight)
+        # For weighted graphs, only keep edges with high weights
+        if edge_weight.max() > 1:
+            print("Pruning low-weight edges")
+            print("Num edges before: %d" % len(edge_weight))
+            edge_weight = pre_process_edge_weights(edge_weight)
+            edge_index = edge_index[:, edge_weight != 0]
+            edge_weight = edge_weight[edge_weight != 0]
+            print("Num edges after: %d" % len(edge_weight))
 
         num_nodes = x.size(0)
         y = torch.zeros(num_nodes, dtype=torch.long)
@@ -64,6 +76,15 @@ class OGModel:
         test_mask = torch.zeros(num_nodes, dtype=torch.bool)
         test_mask[test_indices] = 1
         data.test_mask = test_mask
+        
+        # Include class weights for better optim
+        num_classes=int(max(y)) + 1 
+        per_class = [ 0 ] * num_classes
+        for label in y[inds]:
+            per_class[label] += 1
+        weight_vector = [ max(per_class) / a for a in per_class ] 
+        data.class_weights = torch.tensor(weight_vector)
+        
         return data
 
     
@@ -200,6 +221,59 @@ class Node2VecFeatures(OGModel):
             model.train()
             optimizer.zero_grad()
             loss = F.nll_loss(model(data)[data.train_mask], data.y[data.train_mask])
+            loss.backward()
+            optimizer.step()
+        return model
+    
+class JustFeatures(OGModel):
+    def __init__(self):
+        super().__init__()
+        
+    def train(self, data):
+        model = JustFeaturesModule(
+            features_num=data.x.size()[1],
+            num_class=int(max(data.y))+1,
+            num_layers=3,
+            hidden=128
+        )
+        
+        print('Num features: %d\tNum classes: %d' % (data.x.size()[1], int(max(data.y))+1))
+        print('Num nodes: %d\tNum edges:%d' % (data.x.size()[0], data.edge_index.size()[1]))        
+        model = model.to(self.device)
+        data = data.to(self.device)
+        
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+
+        min_loss = float('inf')
+        for epoch in range(1,800):
+            model.train()
+            optimizer.zero_grad()
+            loss = F.nll_loss(model(data)[data.train_mask], data.y[data.train_mask], weight=data.class_weights)
+            loss.backward()
+            optimizer.step()
+        return model
+    
+class GraphSAGEModel(OGModel):
+    def __init__(self):
+        super().__init__()
+        
+    def train(self, data):
+        model = GraphSAGE(
+            features_num=data.x.size()[1], 
+            num_class=int(max(data.y)) + 1,
+            num_layers=2,
+            hidden=16
+        )
+        
+        model = model.to(self.device)
+        data = data.to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+
+        min_loss = float('inf')
+        for epoch in range(1,800):
+            model.train()
+            optimizer.zero_grad()
+            loss = F.nll_loss(model(data)[data.train_mask], data.y[data.train_mask], weight=data.class_weights)
             loss.backward()
             optimizer.step()
         return model

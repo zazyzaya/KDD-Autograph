@@ -11,4 +11,4 @@ def fix_seed(seed):
     torch.backends.cudnn.deterministic = True
 fix_seed(1234)
 
-from models import Node2VecCombo as Model
+from models import GraphSAGEModel as Model
