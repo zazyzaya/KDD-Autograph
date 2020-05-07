@@ -11,4 +11,4 @@ def fix_seed(seed):
     torch.backends.cudnn.deterministic = True
 fix_seed(1234)
 
-from models import GraphSAGEModel as Model
+from models import OGModel as Model

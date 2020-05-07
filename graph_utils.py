@@ -96,7 +96,7 @@ def pre_process_feats(X, percentile=.90):
     v = X.var()
     print(v[1:].mean())
     print(v[1:].std())
-    min_var = v[1:].mean() + v[1:].std()*norm.ppf(percentile)
+    min_var = np.percentile(v[1:], percentile*100)
     
     cols = X.columns
     
@@ -127,4 +127,36 @@ def pre_process_edge_weights(ew, percentile=0.99):
     # Any values less than percentile are now negative.
     # Run through ReLU to turn into 0s 
     return F.relu(ew)
+
+import torch
+def get_dim_list(ei, ew, num_nodes):
+    el = ei[0].numpy()
+    idx, cnt = np.unique(el, return_counts=True)
+    cnt = cnt.astype('float64')
     
+    dims = torch.zeros((num_nodes,1))
+    avg_weight = torch.zeros((num_nodes, 1))
+    
+    # I don't know if there's a builtin torch method
+    # to do this efficiently, but this is the best 
+    # I could do...
+    for i in range(len(idx)):
+        dims[idx[i]] = cnt[i]
+   
+    curnode = 0     
+    weights = []
+    for i in range(len(el)):
+        if el[i] == curnode:
+            weights.append(ew[i])
+        else:
+            avg_weight[curnode] += sum(weights)/len(weights)
+            curnode = el[i]
+            weights = [ew[i]]
+    avg_weight[curnode] += sum(weights)/len(weights)
+    
+        
+    return torch.cat((dims/dims.max(), avg_weight), dim=1)
+
+def add_dim_to_features(ei, ew, feats):
+    dims = get_dim_list(ei, ew, feats.size()[0])
+    return torch.cat((feats, dims), dim=1)

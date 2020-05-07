@@ -9,7 +9,9 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from torch.nn import Linear
-from torch_geometric.nn import GCNConv, SAGEConv, JumpingKnowledge, Node2Vec
+from torch_geometric.nn import GCNConv, SAGEConv, JumpingKnowledge
+from torch_geometric.nn import Node2Vec, MessagePassing
+from torch_geometric.nn.pool.edge_pool import EdgePooling
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
 
@@ -52,6 +54,7 @@ class GCN(torch.nn.Module):
 class GraphSAGE(torch.nn.Module):
     def __init__(self, num_layers=2, hidden=16,  features_num=16, num_class=2):
         super().__init__()
+        
         self.sage1 = SAGEConv(features_num, hidden)
         self.convs = torch.nn.ModuleList()
         for i in range(num_layers - 1):
@@ -67,6 +70,7 @@ class GraphSAGE(torch.nn.Module):
 
     def forward(self, data):
         x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
+        
         x = F.relu(self.sage1(x, edge_index, edge_weight=edge_weight))
         x = F.dropout(x, p=0.5, training=self.training)
         for conv in self.convs:
@@ -197,3 +201,7 @@ class JustFeaturesModule(torch.nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.last_lin(x)
         return F.log_softmax(x, dim=-1)
+    
+
+        
+    

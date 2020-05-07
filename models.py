@@ -13,7 +13,7 @@ from torch_geometric.nn import GCNConv, JumpingKnowledge, Node2Vec
 from torch_geometric.data import Data
 from torch_geometric.utils import to_networkx
 
-from graph_utils import pre_process_feats, pre_process_edge_weights
+from graph_utils import *
 from math import log 
 
 from modules import * 
@@ -28,15 +28,6 @@ class OGModel:
     def generate_pyg_data(self, data):
         x = data['fea_table']
         x = pre_process_feats(x)
-        
-        if x.shape[1] == 1:
-            x = x.to_numpy()
-            x = x.reshape(x.shape[0])
-            x = np.array(pd.get_dummies(x))
-        else:
-            x = x.drop('node_index', axis=1).to_numpy()
-
-        x = torch.tensor(x, dtype=torch.float)
 
         df = data['edge_file']
         edge_index = df[['src_idx', 'dst_idx']].to_numpy()
@@ -45,6 +36,18 @@ class OGModel:
 
         edge_weight = df['edge_weight'].to_numpy()
         edge_weight = torch.tensor(edge_weight, dtype=torch.float32)
+        
+        if x.shape[1] == 1:
+            x = x.to_numpy()
+            x = x.reshape(x.shape[0])
+            x = np.array(pd.get_dummies(x))
+            has_features = False
+        else:
+            x = x.drop('node_index', axis=1).to_numpy()
+            has_features = True
+        
+        x = torch.tensor(x, dtype=torch.float)
+        x = add_dim_to_features(edge_index, edge_weight, x)
         
         print(edge_weight)
         # For weighted graphs, only keep edges with high weights
@@ -67,6 +70,8 @@ class OGModel:
 
         data = Data(x=x, edge_index=edge_index, y=y, edge_weight=edge_weight)
 
+        # Graph metadata
+        data.has_features = has_features
         data.num_nodes = num_nodes
 
         train_mask = torch.zeros(num_nodes, dtype=torch.bool)
@@ -85,6 +90,8 @@ class OGModel:
         weight_vector = [ max(per_class) / a for a in per_class ] 
         data.class_weights = torch.tensor(weight_vector)
         
+        print(data.x)
+        print("Num features: %d" % data.x.size()[1])
         return data
 
     
@@ -92,6 +99,7 @@ class OGModel:
         model = GCN(
             features_num=data.x.size()[1], 
             num_class=int(max(data.y)) + 1,
+            aggr='mean'
         )
         
         model = model.to(self.device)
@@ -121,42 +129,6 @@ class OGModel:
 
         return pred.cpu().numpy().flatten()
 
-'''
-Uses metadata about the graph to inform hyper params
-'''
-class DynamicModel(OGModel):
-    def __init__(self):
-        super().__init__()
-
-    def train(self, data):
-        nx_g = to_networkx(data)
-        dia,dim = graph_data(nx_g, sample_size=0.25, workers=8)
-        
-        n_layers = int(1+log(dia))
-        degree_hidden = int(dim/(n_layers**2))
-        
-        print('Diameter: %d\tDimension: %d' % (dia,dim))
-        print('N_layers: %d\tN_hidden: %d' % (n_layers, degree_hidden))
-        
-        model = GCN(
-            features_num=data.x.size()[1], 
-            num_class=int(max(data.y)) + 1,
-            num_layers=n_layers,
-            hidden=degree_hidden
-        )
-        
-        model = model.to(self.device)
-        data = data.to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
-
-        min_loss = float('inf')
-        for epoch in range(1,800):
-            model.train()
-            optimizer.zero_grad()
-            loss = F.nll_loss(model(data)[data.train_mask], data.y[data.train_mask])
-            loss.backward()
-            optimizer.step()
-        return model
     
 '''
 Generates node2vec embeddings, then adds them to node features. 
@@ -190,6 +162,7 @@ class Node2VecCombo(OGModel):
             loss.backward()
             optimizer.step()
         return model
+    
     
 '''
 Generates node2vec embeddings, then completely ignores graph
@@ -225,6 +198,7 @@ class Node2VecFeatures(OGModel):
             optimizer.step()
         return model
     
+    
 class JustFeatures(OGModel):
     def __init__(self):
         super().__init__()
@@ -253,6 +227,7 @@ class JustFeatures(OGModel):
             optimizer.step()
         return model
     
+    
 class GraphSAGEModel(OGModel):
     def __init__(self):
         super().__init__()
@@ -277,3 +252,11 @@ class GraphSAGEModel(OGModel):
             loss.backward()
             optimizer.step()
         return model
+    
+class Node2VecModel(OGModel):
+    def __init__(self):
+        super().__init__()
+        
+    # TODO 
+    def train(self, data):
+        pass
