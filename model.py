@@ -13,9 +13,12 @@ from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 # Graph Learning Models:
 from torch_geometric.nn import JumpingKnowledge, Node2Vec
 
+from math import log
 import networkx as nx
 
 from torch_geometric.data import Data
+from torch_geometric.utils import degree
+
 import copy
 
 import random
@@ -116,7 +119,7 @@ class Model:
     def generate_pyg_data(self, data):
         NORMALIZE_FEATS = False
         ADD_GRAPH_FEATS = False
-        TRAIN_MAX_CC_ONLY = False
+        TRAIN_MAX_CC_ONLY = False 
 
         G = nx.Graph()
         has_feats = True
@@ -178,7 +181,7 @@ class Model:
         edge_index = df[['src_idx', 'dst_idx']].to_numpy()
         
         # Now we can finish building our NetworkX graph and compute graph features
-        if ADD_GRAPH_FEATS:
+        if ADD_GRAPH_FEATS and has_feats:
             print("Adding graph feats")
             for [ a, b] in edge_index:
                 G.add_edge(a,b) 
@@ -204,7 +207,7 @@ class Model:
         all_train_indices = data['train_indices']
         print("Num all training: %d" % len(all_train_indices))
        
-        if TRAIN_MAX_CC_ONLY:
+        if TRAIN_MAX_CC_ONLY and has_feats:
             # Only include those from maximum connected component
             max_cc_only_indices = set(all_train_indices).intersection(set(max_cc))
             print("Max cc only training indices: %d" % len(max_cc_only_indices))
@@ -289,20 +292,35 @@ class Model:
         val_patience = 50 # how long validation loss can increase before we stop
 
         if not data.has_features:
-            embedding_dim = 128
+            avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
+            
+            # Requires at least len(class) dimensions, but give it a little more
+            embedding_dim = 128 + int(data.weighted_loss.size()[0] ** (1/2))
+            
+            # The larger the avg degree, the less distant walks matter
+            # Of course, a minimum is still important
+            context_size = int(log(data.edge_index.size()[1])/avg_degree)
+            context_size = context_size if context_size > 1 else 2
+            
+            # We should look at at least 1 context per walk
+            walk_len = context_size + 1
+        
+            print('Embedding dim: %d\tWalk Len: %d\tContext size: %d\tNum neg samples: %d'
+                  % (embedding_dim, walk_len, context_size, walk_len*context_size))
         
             embedder = Node2Vec(
                 data.x.size()[0],   # Num nodes
                 embedding_dim,      # Embedding dimesion
-                7,                  # Walk len  
-                3,                  # Context size 
+                walk_len,           # Walk len  
+                context_size,       # Context size 
+                num_negative_samples=walk_len*context_size
             )
             
             # First, train embedder
             # Use a higher learning rate, bc this part is
             # meant to be kind of "quick and dirty"
             embedder = self.n2v_trainer(
-                data, embedder, lr=0.1
+                data, embedder, lr=0.05, patience=50 # lower patience when time is important
             )
             
             # Then use n2v embeddings as features
@@ -366,14 +384,14 @@ class Model:
         return pred.cpu().numpy().flatten()
 
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
-                    patience=50, verbosity=0.5, lr=0.01):
+                    patience=25, verbosity=1, lr=0.01):
         
         print("Training n2v")
         model = model.to(self.device)
         data = data.to(self.device)
         
         loss_min=1000
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         increase = 0
         
         for epoch in range(epochs):
@@ -382,6 +400,9 @@ class Model:
             loss = model.loss(data.edge_index)
             loss.backward()
             optimizer.step()
+            
+            if verbosity >= 1:
+                print('[%d] Loss: %.3f' % (epoch, loss))
             
             if loss > loss_min and early_stopping:
                 increase+= 1
