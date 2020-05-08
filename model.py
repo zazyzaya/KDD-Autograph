@@ -178,7 +178,7 @@ class Model:
         edge_index = df[['src_idx', 'dst_idx']].to_numpy()
         
         # Now we can finish building our NetworkX graph and compute graph features
-        if ADD_GRAPH_FEATS and has_feats:
+        if ADD_GRAPH_FEATS:
             print("Adding graph feats")
             for [ a, b] in edge_index:
                 G.add_edge(a,b) 
@@ -204,7 +204,7 @@ class Model:
         all_train_indices = data['train_indices']
         print("Num all training: %d" % len(all_train_indices))
        
-        if TRAIN_MAX_CC_ONLY and has_feats:
+        if TRAIN_MAX_CC_ONLY:
             # Only include those from maximum connected component
             max_cc_only_indices = set(all_train_indices).intersection(set(max_cc))
             print("Max cc only training indices: %d" % len(max_cc_only_indices))
@@ -290,22 +290,19 @@ class Model:
 
         if not data.has_features:
             embedding_dim = 128
-            walk_len = 7
-            context_size = 5
         
             embedder = Node2Vec(
                 data.x.size()[0],   # Num nodes
                 embedding_dim,      # Embedding dimesion
-                walk_len,           # Walk len  
-                context_size,       # Context size 
-                num_negative_samples=walk_len*context_size
+                7,                  # Walk len  
+                3,                  # Context size 
             )
             
             # First, train embedder
             # Use a higher learning rate, bc this part is
             # meant to be kind of "quick and dirty"
             embedder = self.n2v_trainer(
-                data, embedder, lr=0.05, patience=5
+                data, embedder, lr=0.1
             )
             
             # Then use n2v embeddings as features
@@ -369,14 +366,14 @@ class Model:
         return pred.cpu().numpy().flatten()
 
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
-                    patience=15, verbosity=1, lr=0.01):
+                    patience=50, verbosity=0.5, lr=0.01):
         
         print("Training n2v")
         model = model.to(self.device)
         data = data.to(self.device)
         
         loss_min=1000
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         increase = 0
         
         for epoch in range(epochs):
@@ -385,9 +382,6 @@ class Model:
             loss = model.loss(data.edge_index)
             loss.backward()
             optimizer.step()
-            
-            if verbosity >= 1:
-                print('[%d] Loss: %.3f' % (epoch, loss))
             
             if loss > loss_min and early_stopping:
                 increase+= 1
