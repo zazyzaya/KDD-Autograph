@@ -13,9 +13,12 @@ from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 # Graph Learning Models:
 from torch_geometric.nn import JumpingKnowledge, Node2Vec
 
+from math import log
 import networkx as nx
 
 from torch_geometric.data import Data
+from torch_geometric.utils import degree
+
 import copy
 
 import random
@@ -116,7 +119,7 @@ class Model:
     def generate_pyg_data(self, data):
         NORMALIZE_FEATS = False
         ADD_GRAPH_FEATS = False
-        TRAIN_MAX_CC_ONLY = False
+        TRAIN_MAX_CC_ONLY = False 
 
         G = nx.Graph()
         has_feats = True
@@ -289,9 +292,21 @@ class Model:
         val_patience = 50 # how long validation loss can increase before we stop
 
         if not data.has_features:
-            embedding_dim = 128
-            walk_len = 7
-            context_size = 5
+            avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
+            
+            # Requires at least len(class) dimensions, but give it a little more
+            embedding_dim = 128 + int(data.weighted_loss.size()[0] ** (1/2))
+            
+            # The larger the avg degree, the less distant walks matter
+            # Of course, a minimum is still important
+            context_size = int(log(data.edge_index.size()[1])/avg_degree)
+            context_size = context_size if context_size > 1 else 2
+            
+            # We should look at at least 1 context per walk
+            walk_len = (context_size + 1)*2
+        
+            print('Embedding dim: %d\tWalk Len: %d\tContext size: %d\tNum neg samples: %d'
+                  % (embedding_dim, walk_len, context_size, walk_len*context_size))
         
             embedder = Node2Vec(
                 data.x.size()[0],   # Num nodes
@@ -305,11 +320,8 @@ class Model:
             # Use a higher learning rate, bc this part is
             # meant to be kind of "quick and dirty"
             embedder = self.n2v_trainer(
-                data, embedder, lr=0.05
+                data, embedder, lr=0.05, patience=50 # lower patience when time is important
             )
-            
-            # Then use n2v embeddings as features
-            data.x = embedder.embedding.weight
 
         model = GCN(features_num=data.x.size()[1], num_class=int(max(data.y)) + 1, hidden=hidden, num_layers=num_layers)
 
@@ -369,7 +381,7 @@ class Model:
         return pred.cpu().numpy().flatten()
 
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
-                    patience=15, verbosity=1, lr=0.01):
+                    patience=25, verbosity=1, lr=0.01):
         
         print("Training n2v")
         model = model.to(self.device)
