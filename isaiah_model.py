@@ -1,15 +1,14 @@
 '''
 Dataset,score,      time
-A,      0.8716,     16.120949029922485     
-B,      0.7486,     4.425185918807983
-C,      0.8421,     57.29339838027954
-D,      0.9306,     167.68811798095703
-E,      0.8353,     98.71457004547119
+A,      0.8735,     16.644752502441406     
+B,      0.7526,     4.956048250198364
+C,      0.844,      64.1747362613678
+D,      0.9317,     290.52115273475647 (note: default max runtime is 200)
+E,      0.8778,     107.15986800193787 (note: default max runtime is 100)
 '''
 
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn.functional as F
 
@@ -120,48 +119,22 @@ class GCN(torch.nn.Module):
 
 
 class Model:
-
     def __init__(self):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    def gen_graph_feats(self, G):
-        degree_list = [ G.degree(n) for n in G.nodes() ]
-        ccs = list(nx.connected_components(G))
-        node_to_cc_size = {}
-   
-        max_cc = []
+    def gen_graph_feats(self, G, x):
+        dims = torch.tensor(
+            [[G.degree(n) for n in range(x.size()[0])]], 
+            dtype=torch.float
+        ).T
         
-        for cc in ccs:
-            curr_cc_size = len(cc)
-            if curr_cc_size > len(max_cc):
-                max_cc = cc
-            for nid in cc:
-                node_to_cc_size[nid] = curr_cc_size
- 
-        graph_feats = []
-        for n in range(len(G.nodes())):
-            #graph_feats.append([ G.degree(n), node_to_cc_size[n] ])
-            graph_feats.append([ G.degree(n) ])
+        # Normalize and return 
+        return dims / dims.max()
 
-        graph_feats = np.array(graph_feats)
-        #for column in range(graph_feats.shape[1]):
-        #    c_smallest = graph_feats[:,column].min()
-            # shift smallest to 0
-        #    graph_feats[:,column] = graph_feats[:,column] - c_smallest
-
-            # scale max to 1
-        #    c_largest = graph_feats[:,column].max()
-        #    print("Column %d largest: %d" % (column, int(c_largest)))
-        #    graph_feats[:,column] = graph_feats[:,column] / c_largest
-        return graph_feats, max_cc
-
-    def generate_pyg_data(self, data):
-        NORMALIZE_FEATS = False
-        ADD_GRAPH_FEATS = False
-        TRAIN_MAX_CC_ONLY = False 
-
+    def generate_pyg_data(self, data): 
         G = nx.Graph()
         has_feats = True
+        ADD_GRAPH_FEATS = True
 
         # Load Feature Table
         x = data['fea_table']
@@ -187,21 +160,6 @@ class Model:
             print(x.max())
             print("Min Feature:")
             print(x.min())
-            if (x.max() > 1.0 or x.min() < 0.0) and NORMALIZE_FEATS:
-                print("Normalizing features by column into [0,1] ...")
-                for column in range(x.shape[1]):
-                   c_smallest = x[:,column].min()
-                   # shift smallest to 0
-                   x[:,column] = x[:,column] + abs(c_smallest)
-                 
-                   # scale max to 1
-                   c_largest = x[:,column].max()
-                   x[:,column] = x[:,column] / c_largest
-                print("Feature normalization complete:")
-                print("Max Feature:")
-                print(x.max())
-                print("Min Feature:")
-                print(x.min())
             
             # weird case with 0 features
             if x.min() == x.max():
@@ -219,17 +177,16 @@ class Model:
         df = data['edge_file']
         edge_index = df[['src_idx', 'dst_idx']].to_numpy()
         
+        # Convert input data to tensor
+        x = torch.tensor(x, dtype=torch.float)
+        
         # Now we can finish building our NetworkX graph and compute graph features
-        if ADD_GRAPH_FEATS and has_feats:
+        if ADD_GRAPH_FEATS:
             print("Adding graph feats")
             for [ a, b] in edge_index:
                 G.add_edge(a,b) 
-            graph_feats, max_cc = self.gen_graph_feats(G)
-            x = np.hstack((x, graph_feats))
+            graph_feats = self.gen_graph_feats(G, x)
         
-        # Convert input data to tensor
-        x = torch.tensor(x, dtype=torch.float)
-
         # Load the graph data
         print('Sorting edges')
         
@@ -241,27 +198,6 @@ class Model:
         
         # This is a very computationally expensive line of code.
         # print("Max/Min edge weight: %f/%f" % (max(edge_weight), min(edge_weight)))
-
-        # Build train,validate, and test masks
-        all_train_indices = data['train_indices']
-        print("Num all training: %d" % len(all_train_indices))
-       
-        if TRAIN_MAX_CC_ONLY and has_feats:
-            # Only include those from maximum connected component
-            max_cc_only_indices = set(all_train_indices).intersection(set(max_cc))
-            print("Max cc only training indices: %d" % len(max_cc_only_indices))
-            all_train_indices = list(max_cc_only_indices)
-
-        # 80/20 train/val split
-        num_train = int(len(all_train_indices) * 0.8)
-        num_val = len(all_train_indices) - num_train
-
-        print("Num train nodes: %d" % num_train)
-        print("Num val nodes: %d" % num_val)  
-        np.random.shuffle(all_train_indices) # make sure indices are random
-
-        train_indices = all_train_indices[:num_train]
-        val_indices = all_train_indices[num_train:]
         
         # Build training labels
         num_nodes = x.size(0)
@@ -276,15 +212,32 @@ class Model:
         per_class = [ 0 ] * num_classes
         for label in y[inds]:
             per_class[label] += 1
+        
         print("Samples per class:")
         print(per_class)
         per_class_percent = [ (a*100)/len(inds) for a in per_class ]
         print("Class Distribution:")
         print(per_class_percent)
+        
         # Let's build a class weight tensor for weighted loss
         weight_vector = [ max(per_class) / a for a in per_class ] 
         print("Weight vector for weighted loss calcs:")
         print(weight_vector)
+
+        # Build train,validate, and test masks
+        all_train_indices = data['train_indices']
+        print("Num all training: %d" % len(all_train_indices))
+
+        # 80/20 train/val split
+        num_train = int(len(all_train_indices) * 0.8)
+        num_val = len(all_train_indices) - num_train
+
+        print("Num train nodes: %d" % num_train)
+        print("Num val nodes: %d" % num_val)  
+        np.random.shuffle(all_train_indices) # make sure indices are random
+
+        train_indices = all_train_indices[:num_train]
+        val_indices = all_train_indices[num_train:]
 
         # Lets check our validation set and make sure it looks reasonable:
         print("Validation Set Distribution:")
@@ -303,6 +256,9 @@ class Model:
 
         data = Data(x=x, edge_index=edge_index, y=y, edge_weight=edge_weight)
 
+        if ADD_GRAPH_FEATS:
+            data.graph_data = graph_feats
+            
         data.num_nodes = num_nodes
         data.per_class_percent = per_class_percent
 
@@ -325,6 +281,7 @@ class Model:
 
     def train(self, data):        
         ADD_N2V = False
+        ADD_GRAPH_FEATS = True
         
         # Graph data
         avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
@@ -347,7 +304,7 @@ class Model:
         print(hidden)
         if not data.has_features or simplified or ADD_N2V:
             # Requires at least len(class) dimensions, but give it a little more
-            embedding_dim = 128 + int(data.weighted_loss.size()[0] ** (1/2))
+            embedding_dim = 128 + int(avg_degree ** (1/2))
             
             # The larger the avg degree, the less distant walks matter
             # Of course, a minimum is still important
@@ -384,6 +341,11 @@ class Model:
             print('Num feature before: %d' % data.x.size()[1])
             data.x = var_thresh(data.x)
             print('Num features after: %d' % data.x.size()[1])
+
+        print(data.x.size())
+        print(data.graph_data.size())
+        if ADD_GRAPH_FEATS:
+            data.x = torch.cat((data.x, data.graph_data), axis=1)
 
         if simplified:
             model = JustFeatures(
@@ -481,7 +443,7 @@ class Model:
                 increase+= 1
             else:
                 if verbosity > 0:
-                    print("===New Minimum validation loss===")
+                    print("===New Minimum loss===")
                 loss_min = loss
                 increase=0
                 state_dict_save = copy.deepcopy(model.state_dict())
