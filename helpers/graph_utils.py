@@ -182,3 +182,17 @@ def get_dim_list(ei, ew, num_nodes):
 def add_dim_to_features(ei, ew, feats):
     dims = get_dim_list(ei, ew, feats.size()[0])
     return torch.cat((feats, dims), dim=1)
+
+from sklearn.feature_selection import VarianceThreshold
+def var_thresh(x, var=0.0):
+    sel = VarianceThreshold(var)
+    
+    x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
+    return x
+
+from sklearn.decomposition import PCA
+def pca(x):
+    sel = PCA(n_components='mle', svd_solver='full')
+    
+    x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
+    return x

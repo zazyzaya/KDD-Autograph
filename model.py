@@ -30,6 +30,36 @@ def fix_seed(seed):
     torch.backends.cudnn.deterministic = True
 fix_seed(1234)
 
+
+class JustFeatures(torch.nn.Module):
+    def __init__(self, num_layers=2, hidden=16, features_num=16, num_class=2):
+        super().__init__()
+        
+        self.first_lin = Linear(features_num, hidden)
+        self.hidden_layers = torch.nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.hidden_layers.append(Linear(hidden, hidden))
+        
+        self.last_lin = Linear(hidden, num_class)
+    
+    def reset_parameters(self):
+        self.first_lin.reset_parameters()
+        for l in self.hidden_layers:
+            l.reset_parameters()
+        self.last_lin.reset_parameters()
+        
+    def forward(self, data):
+        x = data.x 
+        
+        x = F.relu(self.first_lin(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        for l in self.hidden_layers:
+            x = F.relu(l(x))
+        
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.last_lin(x)
+        return F.log_softmax(x, dim=-1)
+
 # GCN model
 class GCN(torch.nn.Module):
 
@@ -265,6 +295,7 @@ class Model:
         data = Data(x=x, edge_index=edge_index, y=y, edge_weight=edge_weight)
 
         data.num_nodes = num_nodes
+        data.per_class_percent = per_class_percent
 
         train_mask = torch.zeros(num_nodes, dtype=torch.bool)
         train_mask[train_indices] = 1
@@ -284,46 +315,75 @@ class Model:
         return data
 
     def train(self, data):
+        # Graph data
+        avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
+        
         # Hyperparamters
         train_epochs=1000
         num_layers=2 # gcn layers
-        hidden = 32
+        hidden = min([int(max(data.y)) ** 2, 256])
         early_stopping=True
         val_patience = 50 # how long validation loss can increase before we stop
 
-        if not data.has_features:
-            avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
-            
+        # If there are too many edges for GCN, use n2v+features
+        simplified = True if (data.edge_index.size()[1] > 1e6 and data.has_features) else False
+        
+        print(hidden)
+        if not data.has_features or simplified:
             # Requires at least len(class) dimensions, but give it a little more
             embedding_dim = 128 + int(data.weighted_loss.size()[0] ** (1/2))
             
             # The larger the avg degree, the less distant walks matter
             # Of course, a minimum is still important
             context_size = int(log(data.edge_index.size()[1])/avg_degree)
-            context_size = context_size if context_size > 1 else 2
+            context_size = context_size if context_size > 2 else 3
             
             # We should look at at least 1 context per walk
-            walk_len = (context_size + 1)*2
+            walk_len = context_size*2 + 1
         
-            print('Embedding dim: %d\tWalk Len: %d\tContext size: %d\tNum neg samples: %d'
-                  % (embedding_dim, walk_len, context_size, walk_len*context_size))
+            print('Embedding dim: %d\tWalk Len: %d\tContext size: %d'
+                  % (embedding_dim, walk_len, context_size))
         
             embedder = Node2Vec(
                 data.x.size()[0],   # Num nodes
                 embedding_dim,      # Embedding dimesion
                 walk_len,           # Walk len  
-                context_size,       # Context size 
-                num_negative_samples=walk_len*context_size
+                context_size       # Context size 
             )
             
             # First, train embedder
             # Use a higher learning rate, bc this part is
             # meant to be kind of "quick and dirty"
             embedder = self.n2v_trainer(
-                data, embedder, lr=0.05, patience=50 # lower patience when time is important
+                data, embedder, lr=0.05#, patience=100 # lower patience when time is important
             )
+            
+            if simplified:
+                data.x = torch.cat((var_thresh(data.x), embedder.embedding.weight), axis=1)
+            else:
+                # Then use n2v embeddings as features
+                data.x = embedder.embedding.weight
+        
+        else:
+            print('Num feature before: %d' % data.x.size()[1])
+            data.x = var_thresh(data.x)
+            print('Num features after: %d' % data.x.size()[1])
 
-        model = GCN(features_num=data.x.size()[1], num_class=int(max(data.y)) + 1, hidden=hidden, num_layers=num_layers)
+        if simplified:
+            model = JustFeatures(
+                features_num=data.x.size()[1], 
+                num_class=int(max(data.y)) + 1, 
+                hidden=hidden, 
+                num_layers=num_layers
+            )
+            
+        else:
+            model = GCN(
+                features_num=data.x.size()[1], 
+                num_class=int(max(data.y)) + 1, 
+                hidden=hidden, 
+                num_layers=num_layers
+            )
 
         # Move data to compute device
         model = model.to(self.device)
@@ -381,7 +441,7 @@ class Model:
         return pred.cpu().numpy().flatten()
 
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
-                    patience=25, verbosity=1, lr=0.01):
+                    patience=10, verbosity=1, lr=0.01):
         
         print("Training n2v")
         model = model.to(self.device)
@@ -406,7 +466,6 @@ class Model:
             else:
                 if verbosity > 0:
                     print("===New Minimum validation loss===")
-                    print("\t\t%0.3f" % loss)
                 loss_min = loss
                 increase=0
                 state_dict_save = copy.deepcopy(model.state_dict())
@@ -419,3 +478,10 @@ class Model:
             model.load_state_dict(state_dict_save)
             
         return model
+    
+from sklearn.feature_selection import VarianceThreshold
+def var_thresh(x, var=0.0):
+    sel = VarianceThreshold(var)
+    
+    x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
+    return x
