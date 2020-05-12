@@ -334,6 +334,11 @@ class Model:
                 data, embedder, lr=0.05, patience=50 # lower patience when time is important
             )
             
+            # Training moves data to GPU. Have to put it back before manipulating
+            # it further. 
+            data = data.to('cpu')
+            embedder = embedder.to('cpu')
+            
             if (simplified and data.has_features) or ADD_N2V:
                 data.x = torch.cat((self.var_thresh(data.x), embedder.embedding.weight), axis=1)
             else:
@@ -461,8 +466,7 @@ class Model:
         return model
     
     def var_thresh(self, x, var=0.0):
-        x = x.cpu()
         sel = VarianceThreshold(var)
         
         x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
-        return x.to(self.device)
+        return x
