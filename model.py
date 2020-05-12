@@ -1,6 +1,14 @@
+'''
+Dataset,score,      time
+A,      0.8833,     13.49905800819397    
+B,      0.7466,     3.937058687210083
+C,      0.8452,     57.5194776058197
+D,      0.9349,     158.0451259613037 (note: default max runtime is 200)
+E,      0.8705,     130.97248578071594 (note: default max runtime is 100)
+'''
+
 import numpy as np
 import pandas as pd
-
 import torch
 import torch.nn.functional as F
 
@@ -12,6 +20,13 @@ from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 
 # Graph Learning Models:
 from torch_geometric.nn import JumpingKnowledge, Node2Vec
+
+# Dimensionality reduction 
+from sklearn.feature_selection import VarianceThreshold
+
+# Balancing samples
+from sklearn.utils import resample
+from sklearn.model_selection import train_test_split
 
 from math import log
 import networkx as nx
@@ -29,6 +44,36 @@ def fix_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 fix_seed(1234)
+
+
+class JustFeatures(torch.nn.Module):
+    def __init__(self, num_layers=2, hidden=16, features_num=16, num_class=2):
+        super().__init__()
+        
+        self.first_lin = Linear(features_num, hidden)
+        self.hidden_layers = torch.nn.ModuleList()
+        for i in range(num_layers - 1):
+            self.hidden_layers.append(Linear(hidden, hidden))
+        
+        self.last_lin = Linear(hidden, num_class)
+    
+    def reset_parameters(self):
+        self.first_lin.reset_parameters()
+        for l in self.hidden_layers:
+            l.reset_parameters()
+        self.last_lin.reset_parameters()
+        
+    def forward(self, data):
+        x = data.x 
+        
+        x = F.relu(self.first_lin(x))
+        x = F.dropout(x, p=0.5, training=self.training)
+        for l in self.hidden_layers:
+            x = F.relu(l(x))
+        
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.last_lin(x)
+        return F.log_softmax(x, dim=-1)
 
 # GCN model
 class GCN(torch.nn.Module):
@@ -81,48 +126,63 @@ class GCN(torch.nn.Module):
 
 
 class Model:
-
     def __init__(self):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    def gen_graph_feats(self, G):
-        degree_list = [ G.degree(n) for n in G.nodes() ]
-        ccs = list(nx.connected_components(G))
-        node_to_cc_size = {}
-   
-        max_cc = []
+    def gen_graph_feats(self, G, x):
+        dims = torch.tensor(
+            [[G.degree(n) for n in range(x.size()[0])]], 
+            dtype=torch.float
+        ).T
         
-        for cc in ccs:
-            curr_cc_size = len(cc)
-            if curr_cc_size > len(max_cc):
-                max_cc = cc
-            for nid in cc:
-                node_to_cc_size[nid] = curr_cc_size
- 
-        graph_feats = []
-        for n in range(len(G.nodes())):
-            #graph_feats.append([ G.degree(n), node_to_cc_size[n] ])
-            graph_feats.append([ G.degree(n) ])
+        # Normalize and return 
+        return dims / dims.max()
 
-        graph_feats = np.array(graph_feats)
-        #for column in range(graph_feats.shape[1]):
-        #    c_smallest = graph_feats[:,column].min()
-            # shift smallest to 0
-        #    graph_feats[:,column] = graph_feats[:,column] - c_smallest
+    def resample(self, indices, y, max_class, undersample=False):
+        # Resample classes at least twice as small as the largest class
+        # and sample |MAX_CLASS| / MIN_SAMPLE more values
+        print('Resampling')
+        MIN_RESAMPLE = 1
+        AMT_RESAMPLE = 1
+        
+        # Split indexes into their classes
+        classes = {}
+        for i in indices:
+            cl = y[i].item()
+            if cl in classes:
+                classes[cl].append(i)
+            else:
+                classes[cl] = [i]
+                
+        print("Has %d classes" % len(classes))
+                
+        # Find number of samples in largest class
+        n = max([len(c) for c in classes.values()])
+        for c in classes.keys():
+            if len(classes[c]) < n/MIN_RESAMPLE:
+                classes[c] = resample(classes[c], n_samples=n//AMT_RESAMPLE)
+            
+            # Additionally, if we want to undersample the majority class
+            # we do that as well
+            elif undersample and len(classes[c]) > n/MIN_RESAMPLE:
+                classes[c] = resample(
+                    classes[c], 
+                    n_samples=n//MIN_RESAMPLE,
+                    replace=False 
+                )
+                
+        # Put all of the newly sampled arrays together
+        ret = []
+        for ids in classes.values():
+            ret += ids
+            
+        return np.array(ret)
+        
 
-            # scale max to 1
-        #    c_largest = graph_feats[:,column].max()
-        #    print("Column %d largest: %d" % (column, int(c_largest)))
-        #    graph_feats[:,column] = graph_feats[:,column] / c_largest
-        return graph_feats, max_cc
-
-    def generate_pyg_data(self, data):
-        NORMALIZE_FEATS = False
-        ADD_GRAPH_FEATS = False
-        TRAIN_MAX_CC_ONLY = False 
-
+    def generate_pyg_data(self, data): 
         G = nx.Graph()
         has_feats = True
+        ADD_GRAPH_FEATS = True
 
         # Load Feature Table
         x = data['fea_table']
@@ -148,21 +208,6 @@ class Model:
             print(x.max())
             print("Min Feature:")
             print(x.min())
-            if (x.max() > 1.0 or x.min() < 0.0) and NORMALIZE_FEATS:
-                print("Normalizing features by column into [0,1] ...")
-                for column in range(x.shape[1]):
-                   c_smallest = x[:,column].min()
-                   # shift smallest to 0
-                   x[:,column] = x[:,column] + abs(c_smallest)
-                 
-                   # scale max to 1
-                   c_largest = x[:,column].max()
-                   x[:,column] = x[:,column] / c_largest
-                print("Feature normalization complete:")
-                print("Max Feature:")
-                print(x.max())
-                print("Min Feature:")
-                print(x.min())
             
             # weird case with 0 features
             if x.min() == x.max():
@@ -180,17 +225,16 @@ class Model:
         df = data['edge_file']
         edge_index = df[['src_idx', 'dst_idx']].to_numpy()
         
+        # Convert input data to tensor
+        x = torch.tensor(x, dtype=torch.float)
+        
         # Now we can finish building our NetworkX graph and compute graph features
-        if ADD_GRAPH_FEATS and has_feats:
+        if ADD_GRAPH_FEATS:
             print("Adding graph feats")
             for [ a, b] in edge_index:
                 G.add_edge(a,b) 
-            graph_feats, max_cc = self.gen_graph_feats(G)
-            x = np.hstack((x, graph_feats))
+            graph_feats = self.gen_graph_feats(G, x)
         
-        # Convert input data to tensor
-        x = torch.tensor(x, dtype=torch.float)
-
         # Load the graph data
         print('Sorting edges')
         
@@ -202,27 +246,6 @@ class Model:
         
         # This is a very computationally expensive line of code.
         # print("Max/Min edge weight: %f/%f" % (max(edge_weight), min(edge_weight)))
-
-        # Build train,validate, and test masks
-        all_train_indices = data['train_indices']
-        print("Num all training: %d" % len(all_train_indices))
-       
-        if TRAIN_MAX_CC_ONLY and has_feats:
-            # Only include those from maximum connected component
-            max_cc_only_indices = set(all_train_indices).intersection(set(max_cc))
-            print("Max cc only training indices: %d" % len(max_cc_only_indices))
-            all_train_indices = list(max_cc_only_indices)
-
-        # 80/20 train/val split
-        num_train = int(len(all_train_indices) * 0.8)
-        num_val = len(all_train_indices) - num_train
-
-        print("Num train nodes: %d" % num_train)
-        print("Num val nodes: %d" % num_val)  
-        np.random.shuffle(all_train_indices) # make sure indices are random
-
-        train_indices = all_train_indices[:num_train]
-        val_indices = all_train_indices[num_train:]
         
         # Build training labels
         num_nodes = x.size(0)
@@ -237,16 +260,67 @@ class Model:
         per_class = [ 0 ] * num_classes
         for label in y[inds]:
             per_class[label] += 1
+        
         print("Samples per class:")
         print(per_class)
         per_class_percent = [ (a*100)/len(inds) for a in per_class ]
         print("Class Distribution:")
         print(per_class_percent)
+        
+        '''
         # Let's build a class weight tensor for weighted loss
         weight_vector = [ max(per_class) / a for a in per_class ] 
         print("Weight vector for weighted loss calcs:")
         print(weight_vector)
+        '''
+        
+        # Use beta-normalized weights for the classes
+        BETA = 1-1e-2
+        per_class = np.array(per_class)
+        effective_num = 1.0 - np.power(BETA, per_class)
+        weights = (1.0 - BETA) / effective_num
+        weight_vector = weights / np.sum(weights) * len(per_class)
+        
+        '''
+        # Use Balanced weighting from Logistic Regression in Rare Events Data, King, Zen, 2001
+        per_class = np.array(per_class)
+        weight_vector = len(inds) / (len(per_class) * per_class)
+        '''
+        
+        print("Weight vector for weighted loss calcs:")
+        print(weight_vector)
+        
+        # Build train,validate, and test masks
+        all_train_indices = data['train_indices']
+        print("Num all training: %d" % len(all_train_indices))
+        
+        '''
+        # 80/20 train/val split
+        num_train = int(len(all_train_indices) * 0.8)
+        num_val = len(all_train_indices) - num_train
 
+        print("Num train nodes: %d" % num_train)
+        print("Num val nodes: %d" % num_val)  
+        np.random.shuffle(all_train_indices) # make sure indices are random
+
+        train_indices = all_train_indices[:num_train]
+        val_indices = all_train_indices[num_train:]
+        '''
+        
+        # More intelligent split that keeps all classes in both splits,
+        # and keeps the same distr of classes
+        train_indices, val_indices = train_test_split(
+            all_train_indices, 
+            test_size=0.25,
+            stratify=y[inds].numpy(),
+            shuffle=True
+        )
+        
+        # train_indices = self.resample(train_indices, y, np.argmax(per_class))
+        
+        print("Num train nodes: %d" % len(train_indices))
+        print("Num val nodes: %d" % len(val_indices))  
+        
         # Lets check our validation set and make sure it looks reasonable:
         print("Validation Set Distribution:")
         per_class = [ 0 ] * num_classes
@@ -264,7 +338,11 @@ class Model:
 
         data = Data(x=x, edge_index=edge_index, y=y, edge_weight=edge_weight)
 
+        if ADD_GRAPH_FEATS:
+            data.graph_data = graph_feats
+            
         data.num_nodes = num_nodes
+        data.per_class_percent = per_class_percent
 
         train_mask = torch.zeros(num_nodes, dtype=torch.bool)
         train_mask[train_indices] = 1
@@ -279,41 +357,53 @@ class Model:
         data.test_mask = test_mask
 
         data.has_features = has_feats
-        data.weighted_loss = torch.tensor(weight_vector)
+        data.weighted_loss = torch.tensor(weight_vector, dtype=torch.float)
 
         return data
 
-    def train(self, data):
+    def train(self, data):        
+        ADD_N2V = False
+        ADD_GRAPH_FEATS = True
+        
+        # Graph data
+        avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
+        
+        # Add n2v embeddings to features if there are an order of magnitude more
+        # edges than there are features
+        if int(log(data.x.size()[0], 10)) < int(log(data.edge_index.size()[1], 10)):
+            ADD_N2V = True
+        
         # Hyperparamters
         train_epochs=1000
         num_layers=2 # gcn layers
-        hidden = 32
+        hidden = min([int(max(data.y)) ** 2, 128])
         early_stopping=True
-        val_patience = 50 # how long validation loss can increase before we stop
+        val_patience = 100 # how long validation loss can increase before we stop
 
-        if not data.has_features:
-            avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
-            
+        # If there are too many edges for GCN, use n2v+features
+        simplified = True if (data.edge_index.size()[1] > 1e6) else False
+        
+        print('Hidden dimensions: %d' % hidden)
+        if not data.has_features or simplified or ADD_N2V:
             # Requires at least len(class) dimensions, but give it a little more
-            embedding_dim = 128 + int(data.weighted_loss.size()[0] ** (1/2))
+            embedding_dim = 128 + int(avg_degree ** (1/2))
             
             # The larger the avg degree, the less distant walks matter
             # Of course, a minimum is still important
             context_size = int(log(data.edge_index.size()[1])/avg_degree)
-            context_size = context_size if context_size > 1 else 2
+            context_size = context_size if context_size > 2 else 3
             
             # We should look at at least 1 context per walk
-            walk_len = context_size + 1
+            walk_len = context_size*2 + 1
         
-            print('Embedding dim: %d\tWalk Len: %d\tContext size: %d\tNum neg samples: %d'
-                  % (embedding_dim, walk_len, context_size, walk_len*context_size))
+            print('Embedding dim: %d\tWalk Len: %d\tContext size: %d'
+                  % (embedding_dim, walk_len, context_size))
         
             embedder = Node2Vec(
                 data.x.size()[0],   # Num nodes
                 embedding_dim,      # Embedding dimesion
                 walk_len,           # Walk len  
-                context_size,       # Context size 
-                num_negative_samples=walk_len*context_size
+                context_size       # Context size 
             )
             
             # First, train embedder
@@ -323,10 +413,42 @@ class Model:
                 data, embedder, lr=0.05, patience=50 # lower patience when time is important
             )
             
-            # Then use n2v embeddings as features
-            data.x = embedder.embedding.weight
+            # Training moves data to GPU. Have to put it back before manipulating
+            # it further. 
+            data = data.to('cpu')
+            embedder = embedder.to('cpu')
+            
+            if (simplified and data.has_features) or ADD_N2V:
+                data.x = torch.cat((self.var_thresh(data.x), embedder.embedding.weight), axis=1)
+            else:
+                # Then use n2v embeddings as features
+                data.x = embedder.embedding.weight
+        
+        else:
+            print('Num feature before: %d' % data.x.size()[1])
+            data.x = self.var_thresh(data.x)
+            print('Num features after: %d' % data.x.size()[1])
 
-        model = GCN(features_num=data.x.size()[1], num_class=int(max(data.y)) + 1, hidden=hidden, num_layers=num_layers)
+        if ADD_GRAPH_FEATS:
+            print('Num feature before: %d' % data.x.size()[1])
+            data.x = torch.cat((data.x, data.graph_data), axis=1)
+            print('Num features after: %d' % data.x.size()[1])
+
+        if simplified:
+            model = JustFeatures(
+                features_num=data.x.size()[1], 
+                num_class=int(max(data.y)) + 1, 
+                hidden=hidden, 
+                num_layers=num_layers
+            )
+            
+        else:
+            model = GCN(
+                features_num=data.x.size()[1], 
+                num_class=int(max(data.y)) + 1, 
+                hidden=hidden, 
+                num_layers=num_layers
+            )
 
         # Move data to compute device
         model = model.to(self.device)
@@ -344,13 +466,22 @@ class Model:
         for epoch in range(1,train_epochs+1):
             model.train()
             optimizer.zero_grad()
-            loss = F.nll_loss(model(data)[data.train_mask], data.y[data.train_mask], weight=data.weighted_loss)
+            loss = F.nll_loss(
+                model(data)[data.train_mask], 
+                data.y[data.train_mask], 
+                weight=data.weighted_loss
+            )
             loss.backward()
             optimizer.step()
             train_loss = loss.item()
+            
             # calculate loss on validation set
             model.eval()
-            loss = F.nll_loss(model(data)[data.val_mask], data.y[data.val_mask])
+            loss = F.nll_loss(
+                model(data)[data.val_mask], 
+                data.y[data.val_mask],
+                weight=data.weighted_loss
+            )
             val_loss = loss.item()
             print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
             if val_loss > val_loss_min and early_stopping:
@@ -384,7 +515,7 @@ class Model:
         return pred.cpu().numpy().flatten()
 
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
-                    patience=25, verbosity=1, lr=0.01):
+                    patience=10, verbosity=1, lr=0.01):
         
         print("Training n2v")
         model = model.to(self.device)
@@ -408,8 +539,7 @@ class Model:
                 increase+= 1
             else:
                 if verbosity > 0:
-                    print("===New Minimum validation loss===")
-                    print("\t\t%0.3f" % loss)
+                    print("===New Minimum loss===")
                 loss_min = loss
                 increase=0
                 state_dict_save = copy.deepcopy(model.state_dict())
@@ -422,3 +552,9 @@ class Model:
             model.load_state_dict(state_dict_save)
             
         return model
+    
+    def var_thresh(self, x, var=0.0):
+        sel = VarianceThreshold(var)
+        
+        x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
+        return x
