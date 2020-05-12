@@ -21,6 +21,9 @@ from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 # Graph Learning Models:
 from torch_geometric.nn import JumpingKnowledge, Node2Vec
 
+# Dimensionality reduction 
+from sklearn.feature_selection import VarianceThreshold
+
 from math import log
 import networkx as nx
 
@@ -296,7 +299,7 @@ class Model:
         num_layers=2 # gcn layers
         hidden = min([int(max(data.y)) ** 2, 128])
         early_stopping=True
-        val_patience = 50 # how long validation loss can increase before we stop
+        val_patience = 100 # how long validation loss can increase before we stop
 
         # If there are too many edges for GCN, use n2v+features
         simplified = True if (data.edge_index.size()[1] > 1e6) else False
@@ -328,24 +331,24 @@ class Model:
             # Use a higher learning rate, bc this part is
             # meant to be kind of "quick and dirty"
             embedder = self.n2v_trainer(
-                data, embedder, lr=0.05#, patience=100 # lower patience when time is important
+                data, embedder, lr=0.05, patience=50 # lower patience when time is important
             )
             
             if (simplified and data.has_features) or ADD_N2V:
-                data.x = torch.cat((var_thresh(data.x), embedder.embedding.weight), axis=1)
+                data.x = torch.cat((self.var_thresh(data.x), embedder.embedding.weight), axis=1)
             else:
                 # Then use n2v embeddings as features
                 data.x = embedder.embedding.weight
         
         else:
             print('Num feature before: %d' % data.x.size()[1])
-            data.x = var_thresh(data.x)
+            data.x = self.var_thresh(data.x)
             print('Num features after: %d' % data.x.size()[1])
 
-        print(data.x.size())
-        print(data.graph_data.size())
         if ADD_GRAPH_FEATS:
+            print('Num feature before: %d' % data.x.size()[1])
             data.x = torch.cat((data.x, data.graph_data), axis=1)
+            print('Num features after: %d' % data.x.size()[1])
 
         if simplified:
             model = JustFeatures(
@@ -457,9 +460,9 @@ class Model:
             
         return model
     
-from sklearn.feature_selection import VarianceThreshold
-def var_thresh(x, var=0.0):
-    sel = VarianceThreshold(var)
-    
-    x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
-    return x
+    def var_thresh(self, x, var=0.0):
+        x = x.cpu()
+        sel = VarianceThreshold(var)
+        
+        x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
+        return x.to(self.device)
