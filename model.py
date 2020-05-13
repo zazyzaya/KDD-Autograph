@@ -2,9 +2,9 @@
 Dataset,score,      time
 A,      0.8833,     13.49905800819397    
 B,      0.7466,     3.937058687210083
-C,      0.8452,     57.5194776058197
-D,      0.9349,     158.0451259613037 (note: default max runtime is 200)
-E,      0.8705,     130.97248578071594 (note: default max runtime is 100)
+C,      0.8634,     84.25939059257507
+D,      0.8736,     227.54316401481628 (note: default max runtime is 200)
+E,      0.8812,     141.2995262145996 (note: default max runtime is 100)
 '''
 
 import numpy as np
@@ -275,7 +275,18 @@ class Model:
         '''
         
         # Use beta-normalized weights for the classes
-        BETA = 1-1e-2
+        '''
+        beta_sensitivity = int(
+            int(log(max(per_class_percent), 8)) - 
+            int(log(min(per_class_percent), 8))
+        ) + 1
+        '''
+        
+        beta_sensitivity = 2
+        
+        print('Beta sensitivity: %d' % beta_sensitivity)
+        
+        BETA = 1-(10 ** -beta_sensitivity)
         per_class = np.array(per_class)
         effective_num = 1.0 - np.power(BETA, per_class)
         weights = (1.0 - BETA) / effective_num
@@ -394,7 +405,7 @@ class Model:
             context_size = context_size if context_size > 2 else 3
             
             # We should look at at least 1 context per walk
-            walk_len = context_size*2 + 1
+            walk_len = context_size + 1
         
             print('Embedding dim: %d\tWalk Len: %d\tContext size: %d'
                   % (embedding_dim, walk_len, context_size))
@@ -403,7 +414,8 @@ class Model:
                 data.x.size()[0],   # Num nodes
                 embedding_dim,      # Embedding dimesion
                 walk_len,           # Walk len  
-                context_size       # Context size 
+                context_size,        # Context size 
+                num_negative_samples=context_size**2
             )
             
             # First, train embedder
@@ -455,7 +467,7 @@ class Model:
         data = data.to(self.device)
 
         # Configure optimizer
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=5e-4)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
   
         # Main training loop
         min_loss = float('inf')
@@ -521,16 +533,19 @@ class Model:
         model = model.to(self.device)
         data = data.to(self.device)
         
+        stopped_early = True
         loss_min=1000
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
         increase = 0
+        epoch = -1
         
-        for epoch in range(epochs):
+        while(True):
             model.train()
             optimizer.zero_grad()
             loss = model.loss(data.edge_index)
             loss.backward()
             optimizer.step()
+            epoch += 1
             
             if verbosity >= 1:
                 print('[%d] Loss: %.3f' % (epoch, loss))
