@@ -1,10 +1,10 @@
 '''
 Dataset,score,      time
-A,      0.8833,     13.49905800819397    
-B,      0.7466,     3.937058687210083
-C,      0.8634,     84.25939059257507
-D,      0.8736,     227.54316401481628 (note: default max runtime is 200)
-E,      0.8812,     141.2995262145996 (note: default max runtime is 100)
+A,      0.8840,     24.511635780334473    
+B,      0.7481,     7.5256383419036865
+C,      0.8642,     85.26456379890442
+D,      0.9276,     202.91653108596802 (note: default max runtime is 200)
+E,      0.8818,     143.4068477153778 (note: default max runtime is 100)
 '''
 
 import numpy as np
@@ -75,6 +75,23 @@ class JustFeatures(torch.nn.Module):
         x = self.last_lin(x)
         return F.log_softmax(x, dim=-1)
 
+class GAT(torch.nn.Module):
+    def __init__(self, num_layers=2, hidden=8, features_num=16, num_class=2, heads=8):
+        super(GAT, self).__init__()
+        self.conv1 = GATConv(features_num, hidden, heads=heads, dropout=0.6)
+        # On the Pubmed dataset, use heads=8 in conv2.
+        self.conv2 = GATConv(hidden * heads, num_class, heads=1, concat=True,dropout=0.6)
+
+    def forward(self, data):
+        x = F.dropout(data.x, p=0.6, training=self.training)
+        x = F.elu(self.conv1(x, data.edge_index))
+        x = F.dropout(x, p=0.6, training=self.training)
+        x = self.conv2(x, data.edge_index)
+        return F.log_softmax(x, dim=1)
+
+    def __repr__(self):
+        return self.__class__.__name__
+    
 # GCN model
 class GCN(torch.nn.Module):
 
@@ -240,6 +257,7 @@ class Model:
         
         edge_index = sorted(edge_index, key=lambda d: d[0])
         edge_index = torch.tensor(edge_index, dtype=torch.long).transpose(0, 1)
+        print("Num edges: %d" % edge_index.size()[1])
         
         edge_weight = df['edge_weight'].to_numpy()
         edge_weight = torch.tensor(edge_weight, dtype=torch.float32)
@@ -390,12 +408,11 @@ class Model:
         hidden = min([int(max(data.y)) ** 2, 128])
         early_stopping=True
         val_patience = 100 # how long validation loss can increase before we stop
-
-        # If there are too many edges for GCN, use n2v+features
-        simplified = True if (data.edge_index.size()[1] > 1e6) else False
+        
+        simplified = True if data.edge_index.size()[1] > 1e6 else False
         
         print('Hidden dimensions: %d' % hidden)
-        if not data.has_features or simplified or ADD_N2V:
+        if not data.has_features or ADD_N2V or simplified:
             # Requires at least len(class) dimensions, but give it a little more
             embedding_dim = 128 + int(avg_degree ** (1/2))
             
@@ -430,7 +447,7 @@ class Model:
             data = data.to('cpu')
             embedder = embedder.to('cpu')
             
-            if (simplified and data.has_features) or ADD_N2V:
+            if data.has_features and ADD_N2V:
                 data.x = torch.cat((self.var_thresh(data.x), embedder.embedding.weight), axis=1)
             else:
                 # Then use n2v embeddings as features
@@ -445,20 +462,31 @@ class Model:
             print('Num feature before: %d' % data.x.size()[1])
             data.x = torch.cat((data.x, data.graph_data), axis=1)
             print('Num features after: %d' % data.x.size()[1])
-
+           
         if simplified:
+            print("Using NN")
             model = JustFeatures(
-                features_num=data.x.size()[1], 
+                features_num=data.x.size()[1],
                 num_class=int(max(data.y)) + 1, 
                 hidden=hidden, 
                 num_layers=num_layers
             )
-            
-        else:
+             
+        elif data.has_features:
+            print("Using GCN")
             model = GCN(
-                features_num=data.x.size()[1], 
+                features_num=data.x.size()[1],
                 num_class=int(max(data.y)) + 1, 
                 hidden=hidden, 
+                num_layers=num_layers
+            )
+          
+        else:
+            print("Using GAT")
+            model = GAT(
+                features_num=data.x.size()[1], 
+                num_class=int(max(data.y)) + 1, 
+                #hidden=hidden, 
                 num_layers=num_layers
             )
 
@@ -474,7 +502,7 @@ class Model:
         val_loss_min = 1000
         val_increase=0
         stopped_early=False
-        state_dict_save = {}
+        state_dict_save = 'checkpoint.model'
         for epoch in range(1,train_epochs+1):
             model.train()
             optimizer.zero_grad()
@@ -502,14 +530,18 @@ class Model:
                 print("===New Minimum validation loss===")
                 val_loss_min = val_loss
                 val_increase=0
-                state_dict_save = copy.deepcopy(model.state_dict())
+                torch.save(model.state_dict(), state_dict_save)
+                    
             if val_increase > val_patience:
                 print("Early stopping!")
                 stopped_early=True
                 break
         if stopped_early:
             print("Reloading best parameters!")
-            model.load_state_dict(state_dict_save)
+            
+            # State dict saved to CPU so have to load from there(?)
+            model.load_state_dict(torch.load(state_dict_save))
+            
         return model
 
     def pred(self, model, data):
