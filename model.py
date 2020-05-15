@@ -21,6 +21,9 @@ from torch_geometric.nn import GCNConv, SAGEConv, GATConv
 # Graph Learning Models:
 from torch_geometric.nn import JumpingKnowledge, Node2Vec
 
+# Minibatching
+from torch_geometric.data import NeighborSampler
+
 # Dimensionality reduction 
 from sklearn.feature_selection import VarianceThreshold
 
@@ -82,11 +85,14 @@ class GAT(torch.nn.Module):
         # On the Pubmed dataset, use heads=8 in conv2.
         self.conv2 = GATConv(hidden * heads, num_class, heads=1, concat=True,dropout=0.6)
 
-    def forward(self, data):
+    def forward(self, data, edge_index=None):
+        if not edge_index:
+            edge_index = data.edge_index
+            
         x = F.dropout(data.x, p=0.6, training=self.training)
-        x = F.elu(self.conv1(x, data.edge_index))
+        x = F.elu(self.conv1(x, edge_index))
         x = F.dropout(x, p=0.6, training=self.training)
-        x = self.conv2(x, data.edge_index)
+        x = self.conv2(x, edge_index)
         return F.log_softmax(x, dim=1)
 
     def __repr__(self):
@@ -117,8 +123,13 @@ class GCN(torch.nn.Module):
             conv.reset_parameters()
         self.lin2.reset_parameters()
 
-    def forward(self, data):
-        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_weight
+    def forward(self, data, edge_index=[], edge_weight=[]):
+        if len(edge_index) == 0:
+            edge_index = data.edge_index
+        if len(edge_weight) == 0:
+            edge_weight = data.edge_weight
+        
+        x = data.x
         # fully connected layer + relu
         x = F.relu(self.first_lin(x))
  
@@ -410,6 +421,7 @@ class Model:
         val_patience = 100 # how long validation loss can increase before we stop
         
         simplified = True if data.edge_index.size()[1] > 1e6 else False
+        simplified = False
         
         print('Hidden dimensions: %d' % hidden)
         if not data.has_features or ADD_N2V or simplified:
@@ -439,7 +451,7 @@ class Model:
             # Use a higher learning rate, bc this part is
             # meant to be kind of "quick and dirty"
             embedder = self.n2v_trainer(
-                data, embedder, lr=0.05, patience=50 # lower patience when time is important
+                data, embedder, lr=0.05, patience=3#50 # lower patience when time is important
             )
             
             # Training moves data to GPU. Have to put it back before manipulating
@@ -483,16 +495,28 @@ class Model:
           
         else:
             print("Using GAT")
+            heads = int(log(max(data.y) + 1) ** 2)
+            print("Num heads: %d" % heads)
             model = GAT(
                 features_num=data.x.size()[1], 
                 num_class=int(max(data.y)) + 1, 
                 #hidden=hidden, 
-                num_layers=num_layers
+                num_layers=num_layers,
+                heads=heads
             )
 
         # Move data to compute device
         model = model.to(self.device)
         data = data.to(self.device)
+        
+        sampler = NeighborSampler(
+            data, 
+            size=0.75,      # Fraction of neighbors to sample
+            num_hops=3,     # How many hops to sample (maybe make a fraction of avg dim?)
+            batch_size=16,
+            shuffle=True,
+            bipartite=False, # Returns a Data object instead of a DataFlow object
+        )
 
         # Configure optimizer
         optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
@@ -503,44 +527,57 @@ class Model:
         val_increase=0
         stopped_early=False
         state_dict_save = 'checkpoint.model'
+             
         for epoch in range(1,train_epochs+1):
-            model.train()
-            optimizer.zero_grad()
-            loss = F.nll_loss(
-                model(data)[data.train_mask], 
-                data.y[data.train_mask], 
-                weight=data.weighted_loss
-            )
-            loss.backward()
-            optimizer.step()
-            train_loss = loss.item()
-            
-            # calculate loss on validation set
-            model.eval()
-            loss = F.nll_loss(
-                model(data)[data.val_mask], 
-                data.y[data.val_mask],
-                weight=data.weighted_loss
-            )
-            val_loss = loss.item()
-            print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
-            if val_loss > val_loss_min and early_stopping:
-                val_increase+= 1
-            else:
-                print("===New Minimum validation loss===")
-                val_loss_min = val_loss
-                val_increase=0
-                torch.save(model.state_dict(), state_dict_save)
-                    
-            if val_increase > val_patience:
-                print("Early stopping!")
-                stopped_early=True
+            for ns_data in sampler():                
+                model.train()
+                optimizer.zero_grad()
+                loss = F.nll_loss(
+                    model(
+                        data, 
+                        edge_index=ns_data.edge_index,
+                        edge_weight=data.edge_weight[ns_data.e_id]
+                    )[data.train_mask], 
+                    data.y[data.train_mask], 
+                    weight=data.weighted_loss
+                )
+                loss.backward()
+                optimizer.step()
+                train_loss = loss.item()
+                
+                # calculate loss on validation set
+                model.eval()
+                loss = F.nll_loss(
+                     model(
+                        data, 
+                        edge_index=ns_data.edge_index,
+                        edge_weight=data.edge_weight[ns_data.e_id]
+                    )[data.val_mask], 
+                    data.y[data.val_mask],
+                    weight=data.weighted_loss
+                )
+                
+                val_loss = loss.item()
+                print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
+                if val_loss > val_loss_min and early_stopping:
+                    val_increase+= 1
+                else:
+                    print("===New Minimum validation loss===")
+                    val_loss_min = val_loss
+                    val_increase=0
+                    torch.save(model.state_dict(), state_dict_save)
+                        
+                if val_increase > val_patience:
+                    print("Early stopping!")
+                    stopped_early=True
+                    break
+                
+            if stopped_early:
+                print("Reloading best parameters!")
+                
+                # State dict saved to CPU so have to load from there(?)
+                model.load_state_dict(torch.load(state_dict_save))
                 break
-        if stopped_early:
-            print("Reloading best parameters!")
-            
-            # State dict saved to CPU so have to load from there(?)
-            model.load_state_dict(torch.load(state_dict_save))
             
         return model
 
@@ -558,6 +595,9 @@ class Model:
 
         return pred.cpu().numpy().flatten()
 
+    def training_loop(self, data, opt):
+        pass
+    
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
                     patience=10, verbosity=1, lr=0.01):
         
