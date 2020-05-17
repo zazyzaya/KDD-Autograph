@@ -1,16 +1,17 @@
 '''
 Dataset,score,      time
-A,      0.8840,     24.511635780334473    
-B,      0.7481,     7.5256383419036865
+A,      0.8815,     33.23574209213257    
+B,      0.7386,     7.5256383419036865
 C,      0.8642,     85.26456379890442
 D,      0.9276,     202.91653108596802 (note: default max runtime is 200)
-E,      0.8818,     143.4068477153778 (note: default max runtime is 100)
+E,      0.8809,     196.8628749847412 (note: default max runtime is 100)
 '''
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import time
 
 # Generic NN layers
 from torch.nn import Linear
@@ -28,7 +29,7 @@ from sklearn.feature_selection import VarianceThreshold
 from sklearn.utils import resample
 from sklearn.model_selection import train_test_split
 
-from math import log
+from math import log, e
 import networkx as nx
 
 from torch_geometric.data import Data
@@ -245,22 +246,29 @@ class Model:
         # Convert input data to tensor
         x = torch.tensor(x, dtype=torch.float)
         
-        # Now we can finish building our NetworkX graph and compute graph features
-        if ADD_GRAPH_FEATS:
-            print("Adding graph feats")
-            for [ a, b] in edge_index:
-                G.add_edge(a,b) 
-            graph_feats = self.gen_graph_feats(G, x)
-        
         # Load the graph data
         print('Sorting edges')
-        
         edge_index = sorted(edge_index, key=lambda d: d[0])
         edge_index = torch.tensor(edge_index, dtype=torch.long).transpose(0, 1)
         print("Num edges: %d" % edge_index.size()[1])
         
         edge_weight = df['edge_weight'].to_numpy()
         edge_weight = torch.tensor(edge_weight, dtype=torch.float32)
+        
+        # Filter out zero-weight edges
+        edge_index = edge_index[:, edge_weight != 0]
+        edge_weight = edge_weight[edge_weight != 0]
+        print("Num non-zero edges: %d" % edge_index.size()[1])
+        
+        # Now we can finish building our NetworkX graph and compute graph features
+        if ADD_GRAPH_FEATS:
+            print("Adding graph feats")
+            for ei in range(edge_index.size()[1]):
+                a = edge_index[0][ei].item()
+                b = edge_index[1][ei].item()
+                
+                G.add_edge(a, b) 
+            graph_feats = self.gen_graph_feats(G, x)
         
         # This is a very computationally expensive line of code.
         # print("Max/Min edge weight: %f/%f" % (max(edge_weight), min(edge_weight)))
@@ -285,36 +293,12 @@ class Model:
         print("Class Distribution:")
         print(per_class_percent)
         
-        '''
-        # Let's build a class weight tensor for weighted loss
-        weight_vector = [ max(per_class) / a for a in per_class ] 
-        print("Weight vector for weighted loss calcs:")
-        print(weight_vector)
-        '''
-        
-        # Use beta-normalized weights for the classes
-        '''
-        beta_sensitivity = int(
-            int(log(max(per_class_percent), 8)) - 
-            int(log(min(per_class_percent), 8))
-        ) + 1
-        '''
-        
-        beta_sensitivity = 2
-        
-        print('Beta sensitivity: %d' % beta_sensitivity)
-        
-        BETA = 1-(10 ** -beta_sensitivity)
+        # Use beta-normalized weights
+        BETA = 1-(10 ** -2)
         per_class = np.array(per_class)
         effective_num = 1.0 - np.power(BETA, per_class)
         weights = (1.0 - BETA) / effective_num
         weight_vector = weights / np.sum(weights) * len(per_class)
-        
-        '''
-        # Use Balanced weighting from Logistic Regression in Rare Events Data, King, Zen, 2001
-        per_class = np.array(per_class)
-        weight_vector = len(inds) / (len(per_class) * per_class)
-        '''
         
         print("Weight vector for weighted loss calcs:")
         print(weight_vector)
@@ -322,19 +306,6 @@ class Model:
         # Build train,validate, and test masks
         all_train_indices = data['train_indices']
         print("Num all training: %d" % len(all_train_indices))
-        
-        '''
-        # 80/20 train/val split
-        num_train = int(len(all_train_indices) * 0.8)
-        num_val = len(all_train_indices) - num_train
-
-        print("Num train nodes: %d" % num_train)
-        print("Num val nodes: %d" % num_val)  
-        np.random.shuffle(all_train_indices) # make sure indices are random
-
-        train_indices = all_train_indices[:num_train]
-        val_indices = all_train_indices[num_train:]
-        '''
         
         # More intelligent split that keeps all classes in both splits,
         # and keeps the same distr of classes
@@ -360,7 +331,6 @@ class Model:
         per_class_percent = [ (a*100)/len(val_indices) for a in per_class ]
         print("Class Distribution:")
         print(per_class_percent)
-
 
         test_indices = data['test_indices']
         print("Num test nodes: %d" % len(test_indices))
@@ -390,9 +360,10 @@ class Model:
 
         return data
 
-    def train(self, data):        
+    def train(self, data, start_time, time_budget):        
         ADD_N2V = False
         ADD_GRAPH_FEATS = True
+        MIN_TIME = 3 # Stop training loop early if less than this many seconds remain
         
         # Graph data
         avg_degree = degree(data.edge_index[0], data.x.size()[0]).mean()
@@ -405,11 +376,13 @@ class Model:
         # Hyperparamters
         train_epochs=1000
         num_layers=2 # gcn layers
-        hidden = min([int(max(data.y)) ** 2, 128])
+        hidden = min([int(max(data.y)+1) ** 2, 128])
         early_stopping=True
         val_patience = 100 # how long validation loss can increase before we stop
         
+        # Use normal NN if too many edges to handle
         simplified = True if data.edge_index.size()[1] > 1e6 else False
+        simplified = False
         
         print('Hidden dimensions: %d' % hidden)
         if not data.has_features or ADD_N2V or simplified:
@@ -419,7 +392,7 @@ class Model:
             # The larger the avg degree, the less distant walks matter
             # Of course, a minimum is still important
             context_size = int(log(data.edge_index.size()[1])/avg_degree)
-            context_size = context_size if context_size > 2 else 3
+            context_size = context_size if context_size >= 2 else 2
             
             # We should look at at least 1 context per walk
             walk_len = context_size + 1
@@ -486,7 +459,7 @@ class Model:
             model = GAT(
                 features_num=data.x.size()[1], 
                 num_class=int(max(data.y)) + 1, 
-                #hidden=hidden, 
+                hidden=hidden//2, 
                 num_layers=num_layers
             )
 
@@ -495,15 +468,35 @@ class Model:
         data = data.to(self.device)
 
         # Configure optimizer
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
+        lr = 0.005
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5, amsgrad=False)
   
         # Main training loop
         min_loss = float('inf')
         val_loss_min = 1000
+        train_loss_min = 1000
         val_increase=0
         stopped_early=False
         state_dict_save = 'checkpoint.model'
+        
+        # Fraction of patience before restarting with lower lr from best model
+        FRUSTRATION = 25
+        # Number of times to retry training from prev best with lower lr
+        NUM_REDOS = 15
+        # Smallest value we allow loss to be, usually 5e-6
+        MIN_LOSS = 5e-6
+        # How much we decrease loss when frustrated
+        LOSS_DEC_INC = 1.25
+        
+        # What percent validation loss increase we're willing to accept if training loss
+        # goes down by more than that much. The hope is this balances for overfitting?
+        # E.g., an epoch that increases val loss from 1 to 1.01 but decreases train loss
+        # from 1 to 0.98 is considered the best model 
+        GOOD_ENOUGH = 1.001
+        
         for epoch in range(1,train_epochs+1):
+            train_start = time.time()
+            
             model.train()
             optimizer.zero_grad()
             loss = F.nll_loss(
@@ -522,20 +515,47 @@ class Model:
                 data.y[data.val_mask],
                 weight=data.weighted_loss
             )
+            
             val_loss = loss.item()
+            
             print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
-            if val_loss > val_loss_min and early_stopping:
+            if ((val_loss > val_loss_min and early_stopping) and 
+                not (val_loss <= GOOD_ENOUGH*val_loss_min and train_loss*GOOD_ENOUGH <= train_loss_min)):
                 val_increase+= 1
             else:
                 print("===New Minimum validation loss===")
                 val_loss_min = val_loss
+                train_loss_min = train_loss
                 val_increase=0
+                redos=0
                 torch.save(model.state_dict(), state_dict_save)
-                    
-            if val_increase > val_patience:
+            
+            # Want to make sure we have the amount of time it takes
+            # to loop and however much extra we need later
+            time_cutoff = MIN_TIME + (time.time() - train_start)
+            
+            if (val_increase > val_patience or 
+                time_budget - (time.time() - start_time) < time_cutoff):
+                
                 print("Early stopping!")
                 stopped_early=True
                 break
+            
+            # Lower learning rate and start from prev best after model becomes 
+            # frustrated with poor progress
+            if val_increase > val_patience//FRUSTRATION and lr > MIN_LOSS:
+                if redos % NUM_REDOS == 0:
+                    lr /= LOSS_DEC_INC
+                    lr = lr if lr > MIN_LOSS else MIN_LOSS # make sure not less than 5e-6
+                    print('LR decay: New lr: %.6f' % lr)
+                    for g in optimizer.param_groups:
+                        g['lr'] = lr
+                        
+                    model.load_state_dict(torch.load(state_dict_save))
+                
+                redos += 1
+            
+            
         if stopped_early:
             print("Reloading best parameters!")
             
@@ -552,8 +572,10 @@ class Model:
         return pred
 
     def train_predict(self, data, time_budget,n_class,schema):
+        start_time = time.time()
+        
         data = self.generate_pyg_data(data)
-        model = self.train(data)
+        model = self.train(data, start_time, time_budget)
         pred = self.pred(model, data)
 
         return pred.cpu().numpy().flatten()
@@ -571,13 +593,27 @@ class Model:
         increase = 0
         epoch = -1
         
+        redos = 0
+        
+        # Fraction of patience before restarting with lower lr from best model
+        FRUSTRATION = 10
+        # Number of times to retry training from prev best with lower lr
+        NUM_REDOS = 25
+        # Smallest value we allow loss to be, usually 5e-6
+        MIN_LOSS = 5e-6
+        # How much we decrease loss when frustrated
+        LOSS_DEC_INC = 1.25
+        
         while(True):
             model.train()
+            
             optimizer.zero_grad()
             loss = model.loss(data.edge_index)
             loss.backward()
             optimizer.step()
             epoch += 1
+            
+            val_loss = loss.item()
             
             if verbosity >= 1:
                 print('[%d] Loss: %.3f' % (epoch, loss))
@@ -589,18 +625,36 @@ class Model:
                     print("===New Minimum loss===")
                 loss_min = loss
                 increase=0
+                redos=0
                 state_dict_save = copy.deepcopy(model.state_dict())
             if increase > patience:
                 print("Early stopping!")
                 stopped_early=True
                 break
+            
+            # Lower learning rate and start from prev best after model becomes 
+            # frustrated with poor progress
+            if increase > patience//FRUSTRATION and lr > MIN_LOSS:
+                if redos % NUM_REDOS == 0:
+                    lr /= LOSS_DEC_INC
+                    lr = lr if lr > MIN_LOSS else MIN_LOSS # make sure not less than 5e-6
+                    print('LR decay: New lr: %.6f' % lr)
+                    for g in optimizer.param_groups:
+                        g['lr'] = lr
+                        
+                    model.load_state_dict(state_dict_save)
+                    redos = 0
+                
+                redos += 1
+            
+                
         if stopped_early:
             print("Reloading best parameters!")
             model.load_state_dict(state_dict_save)
             
         return model
     
-    def var_thresh(self, x, var=0.0):
+    def var_thresh(self, x, var=0.01):
         sel = VarianceThreshold(var)
         
         x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
