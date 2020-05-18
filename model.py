@@ -30,7 +30,6 @@ from sklearn.utils import resample
 from sklearn.model_selection import train_test_split
 
 from math import log, e
-import networkx as nx
 
 from torch_geometric.data import Data
 from torch_geometric.utils import degree
@@ -80,12 +79,13 @@ class GAT(torch.nn.Module):
     def __init__(self, num_layers=2, hidden=8, features_num=16, num_class=2, heads=8):
         super(GAT, self).__init__()
         self.conv1 = GATConv(features_num, hidden, heads=heads, dropout=0.6)
+        
         # On the Pubmed dataset, use heads=8 in conv2.
         self.conv2 = GATConv(hidden * heads, num_class, heads=1, concat=True,dropout=0.6)
 
     def forward(self, data):
-        x = F.dropout(data.x, p=0.6, training=self.training)
-        x = F.elu(self.conv1(x, data.edge_index))
+        #x = F.dropout(data.x, p=0.6, training=self.training)
+        x = F.elu(self.conv1(data.x, data.edge_index))
         x = F.dropout(x, p=0.6, training=self.training)
         x = self.conv2(x, data.edge_index)
         return F.log_softmax(x, dim=1)
@@ -147,15 +147,6 @@ class Model:
     def __init__(self):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    def gen_graph_feats(self, G, x):
-        dims = torch.tensor(
-            [[G.degree(n) for n in range(x.size()[0])]], 
-            dtype=torch.float
-        ).T
-        
-        # Normalize and return 
-        return dims / dims.max()
-
     def resample(self, indices, y, max_class, undersample=False):
         # Resample classes at least twice as small as the largest class
         # and sample |MAX_CLASS| / MIN_SAMPLE more values
@@ -198,7 +189,6 @@ class Model:
         
 
     def generate_pyg_data(self, data): 
-        G = nx.Graph()
         has_feats = True
         ADD_GRAPH_FEATS = True
 
@@ -206,10 +196,6 @@ class Model:
         x = data['fea_table']
         print("Num Nodes: %d" % x.shape[0])
         print("Node Features: %d" % (int(x.shape[1])-1))
-
-        # Build networkX graph for graph features
-        for nid in range(x.shape[0]):
-            G.add_node(nid)
 
         if x.shape[1] == 1: 
             print("No Features... using 1-hot encoding of node ID")
@@ -260,15 +246,12 @@ class Model:
         edge_weight = edge_weight[edge_weight != 0]
         print("Num non-zero edges: %d" % edge_index.size()[1])
         
-        # Now we can finish building our NetworkX graph and compute graph features
+        # Use torch geometric function; it's faster than building an nx graph
         if ADD_GRAPH_FEATS:
             print("Adding graph feats")
-            for ei in range(edge_index.size()[1]):
-                a = edge_index[0][ei].item()
-                b = edge_index[1][ei].item()
-                
-                G.add_edge(a, b) 
-            graph_feats = self.gen_graph_feats(G, x)
+            graph_feats = degree(edge_index[0], num_nodes=x.size()[0])
+            graph_feats = graph_feats / graph_feats.max()
+            graph_feats = graph_feats.reshape(graph_feats.size()[0], 1)
         
         # This is a very computationally expensive line of code.
         # print("Max/Min edge weight: %f/%f" % (max(edge_weight), min(edge_weight)))
@@ -376,7 +359,15 @@ class Model:
         # Hyperparamters
         train_epochs=1000
         num_layers=2 # gcn layers
-        hidden = min([int(max(data.y)+1) ** 2, 64])
+        
+        # Different algorithms for the number of hidden dims for each 
+        if data.has_features:
+            hidden = min([int(max(data.y)+1) ** 2, 64])
+            attn_heads = 'N/a'
+        else:
+            attn_heads = min([int(log(max(data.y)+1)) + 2, 8])
+            hidden = min([int(max(data.y)+1) ** 2, 32]) // attn_heads
+            
         early_stopping=True
         val_patience = 100 # how long validation loss can increase before we stop
         
@@ -385,6 +376,7 @@ class Model:
         simplified = False
         
         print('Hidden dimensions: %d' % hidden)
+        print('Attention heads: %s' % str(attn_heads))
         if not data.has_features or ADD_N2V or simplified:
             # Requires at least len(class) dimensions, but give it a little more
             embedding_dim = 128 + int(avg_degree ** (1/2))
@@ -438,17 +430,8 @@ class Model:
             print('Num feature before: %d' % data.x.size()[1])
             data.x = torch.cat((data.x, data.graph_data), axis=1)
             print('Num features after: %d' % data.x.size()[1])
-           
-        if simplified:
-            print("Using NN")
-            model = JustFeatures(
-                features_num=data.x.size()[1],
-                num_class=int(max(data.y)) + 1, 
-                hidden=hidden, 
-                num_layers=num_layers
-            )
              
-        elif data.has_features:
+        if data.has_features:
             print("Using GCN")
             model = GCN(
                 features_num=data.x.size()[1],
@@ -462,8 +445,9 @@ class Model:
             model = GAT(
                 features_num=data.x.size()[1], 
                 num_class=int(max(data.y)) + 1, 
-                #hidden=hidden//2, 
-                num_layers=num_layers
+                hidden=hidden, 
+                num_layers=num_layers,
+                heads=attn_heads
             )
 
         # Move data to compute device
@@ -495,10 +479,17 @@ class Model:
         # goes down by more than that much. The hope is this balances for overfitting?
         # E.g., an epoch that increases val loss from 1 to 1.01 but decreases train loss
         # from 1 to 0.98 is considered the best model 
-        GOOD_ENOUGH = 1.001
+        GOOD_ENOUGH = 1.0005
         BECOME_FRUSTRATED = False
+        lr_decays = 0
         
-        for epoch in range(1,train_epochs+1):
+        # LR must decay at least this many times before GOOD_ENOUGH training
+        # is activated. This way we're sure it's in a local minimum before we
+        # allow it to stray 
+        GOOD_ENOUGH_THRESH = 1
+        
+        epoch = 0
+        while(True):
             train_start = time.time()
             
             model.train()
@@ -545,6 +536,7 @@ class Model:
                 stopped_early=True
                 break
             
+            
             # Lower learning rate and start from prev best after model becomes 
             # frustrated with poor progress
             if val_increase > val_patience//FRUSTRATION and lr > MIN_LOSS:
@@ -554,12 +546,16 @@ class Model:
                     print('LR decay: New lr: %.6f' % lr)
                     for g in optimizer.param_groups:
                         g['lr'] = lr
+                    
+                    lr_decays += 1
+                    if lr_decays >= GOOD_ENOUGH_THRESH:
+                        BECOME_FRUSTRATED = True
                         
-                    BECOME_FRUSTRATED = True
                     model.load_state_dict(torch.load(state_dict_save))
                 
                 redos += 1
             
+            epoch += 1
             
         if stopped_early:
             print("Reloading best parameters!")
@@ -659,7 +655,7 @@ class Model:
             
         return model
     
-    def var_thresh(self, x, var=0.01):
+    def var_thresh(self, x, var=0.00):
         sel = VarianceThreshold(var)
         
         x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
