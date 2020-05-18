@@ -1,9 +1,9 @@
 '''
 Dataset,score,      time
 A,      0.8815,     33.23574209213257    
-B,      0.7386,     7.5256383419036865
-C,      0.8642,     85.26456379890442
-D,      0.9276,     202.91653108596802 (note: default max runtime is 200)
+B,      0.7441,     7.5256383419036865
+C,      0.9454,     6752.92465209960  (note: default max runtime is 200)
+D,      0.9276,     202.9165310859680 (note: default max runtime is 200)
 E,      0.8809,     196.8628749847412 (note: default max runtime is 100)
 '''
 
@@ -376,7 +376,7 @@ class Model:
         # Hyperparamters
         train_epochs=1000
         num_layers=2 # gcn layers
-        hidden = min([int(max(data.y)+1) ** 2, 128])
+        hidden = min([int(max(data.y)+1) ** 2, 64])
         early_stopping=True
         val_patience = 100 # how long validation loss can increase before we stop
         
@@ -392,7 +392,7 @@ class Model:
             # The larger the avg degree, the less distant walks matter
             # Of course, a minimum is still important
             context_size = int(log(data.edge_index.size()[1])/avg_degree)
-            context_size = context_size if context_size >= 2 else 2
+            context_size = context_size if context_size >= 3 else 3
             
             # We should look at at least 1 context per walk
             walk_len = context_size + 1
@@ -425,6 +425,9 @@ class Model:
             else:
                 # Then use n2v embeddings as features
                 data.x = embedder.embedding.weight
+            
+            # Remove reference to embedder to free up memory on GPU
+            del embedder 
         
         else:
             print('Num feature before: %d' % data.x.size()[1])
@@ -459,7 +462,7 @@ class Model:
             model = GAT(
                 features_num=data.x.size()[1], 
                 num_class=int(max(data.y)) + 1, 
-                hidden=hidden//2, 
+                #hidden=hidden//2, 
                 num_layers=num_layers
             )
 
@@ -493,6 +496,7 @@ class Model:
         # E.g., an epoch that increases val loss from 1 to 1.01 but decreases train loss
         # from 1 to 0.98 is considered the best model 
         GOOD_ENOUGH = 1.001
+        BECOME_FRUSTRATED = False
         
         for epoch in range(1,train_epochs+1):
             train_start = time.time()
@@ -520,7 +524,7 @@ class Model:
             
             print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
             if ((val_loss > val_loss_min and early_stopping) and 
-                not (val_loss <= GOOD_ENOUGH*val_loss_min and train_loss*GOOD_ENOUGH <= train_loss_min)):
+                not (BECOME_FRUSTRATED and val_loss <= GOOD_ENOUGH*val_loss_min and train_loss*GOOD_ENOUGH <= train_loss_min)):
                 val_increase+= 1
             else:
                 print("===New Minimum validation loss===")
@@ -551,6 +555,7 @@ class Model:
                     for g in optimizer.param_groups:
                         g['lr'] = lr
                         
+                    BECOME_FRUSTRATED = True
                     model.load_state_dict(torch.load(state_dict_save))
                 
                 redos += 1
