@@ -1,7 +1,7 @@
 '''
 Dataset,score,      time
-A,      0.8815,     33.23574209213257    
-B,      0.7441,     7.5256383419036865
+A,      0.8821,     26.31732726097107    
+B,      0.7536,     9.116921663284302
 C,      0.9454,     6752.92465209960  (note: default max runtime is 200)
 D,      0.9276,     202.9165310859680 (note: default max runtime is 200)
 E,      0.8809,     196.8628749847412 (note: default max runtime is 100)
@@ -12,15 +12,16 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import time
+import gc 
 
 # Generic NN layers
-from torch.nn import Linear
+from torch.nn import Linear, Bilinear
 
 # Graph Learning layers to build our own models:
-from torch_geometric.nn import GCNConv, SAGEConv, GATConv
+from torch_geometric.nn import GCNConv, SAGEConv, GATConv, TAGConv
 
 # Graph Learning Models:
-from torch_geometric.nn import JumpingKnowledge, Node2Vec
+from torch_geometric.nn import Node2Vec
 
 # Dimensionality reduction 
 from sklearn.feature_selection import VarianceThreshold
@@ -45,46 +46,25 @@ def fix_seed(seed):
     torch.backends.cudnn.deterministic = True
 fix_seed(1234)
 
-
-class JustFeatures(torch.nn.Module):
-    def __init__(self, num_layers=2, hidden=16, features_num=16, num_class=2):
-        super().__init__()
-        
-        self.first_lin = Linear(features_num, hidden)
-        self.hidden_layers = torch.nn.ModuleList()
-        for i in range(num_layers - 1):
-            self.hidden_layers.append(Linear(hidden, hidden))
-        
-        self.last_lin = Linear(hidden, num_class)
-    
-    def reset_parameters(self):
-        self.first_lin.reset_parameters()
-        for l in self.hidden_layers:
-            l.reset_parameters()
-        self.last_lin.reset_parameters()
-        
-    def forward(self, data):
-        x = data.x 
-        
-        x = F.relu(self.first_lin(x))
-        x = F.dropout(x, p=0.5, training=self.training)
-        for l in self.hidden_layers:
-            x = F.relu(l(x))
-        
-        x = F.dropout(x, p=0.5, training=self.training)
-        x = self.last_lin(x)
-        return F.log_softmax(x, dim=-1)
-
 class GAT(torch.nn.Module):
     def __init__(self, num_layers=2, hidden=8, features_num=16, num_class=2, heads=8):
         super(GAT, self).__init__()
-        self.conv1 = GATConv(features_num, hidden, heads=heads, dropout=0.6)
+        #self.lin1 = Linear(features_num, features_num//2)
+        #self.lin2 = Linear(features_num//2, features_num//4)
+        
+        self.conv1 = GATConv(features_num, hidden, heads=heads, dropout=0.6, concat=False)
         
         # On the Pubmed dataset, use heads=8 in conv2.
-        self.conv2 = GATConv(hidden * heads, num_class, heads=1, concat=True,dropout=0.6)
+        self.conv2 = GATConv(hidden, num_class, heads=1, dropout=0.6)
 
     def forward(self, data):
         #x = F.dropout(data.x, p=0.6, training=self.training)
+        #x = F.relu(self.lin1(data.x))
+        #x = F.dropout(x, p=0.6, training=self.training)
+        
+        #x = F.relu(self.lin2(x))
+        #x = F.dropout(x, p=0.6, training=self.training)
+        
         x = F.elu(self.conv1(data.x, data.edge_index))
         x = F.dropout(x, p=0.6, training=self.training)
         x = self.conv2(x, data.edge_index)
@@ -95,7 +75,7 @@ class GAT(torch.nn.Module):
     
 # GCN model
 class GCN(torch.nn.Module):
-
+    
     def __init__(self, num_layers=2, hidden=16,  features_num=16, num_class=2):
         super(GCN, self).__init__()
         # first layer
@@ -146,48 +126,7 @@ class GCN(torch.nn.Module):
 class Model:
     def __init__(self):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    def resample(self, indices, y, max_class, undersample=False):
-        # Resample classes at least twice as small as the largest class
-        # and sample |MAX_CLASS| / MIN_SAMPLE more values
-        print('Resampling')
-        MIN_RESAMPLE = 1
-        AMT_RESAMPLE = 1
         
-        # Split indexes into their classes
-        classes = {}
-        for i in indices:
-            cl = y[i].item()
-            if cl in classes:
-                classes[cl].append(i)
-            else:
-                classes[cl] = [i]
-                
-        print("Has %d classes" % len(classes))
-                
-        # Find number of samples in largest class
-        n = max([len(c) for c in classes.values()])
-        for c in classes.keys():
-            if len(classes[c]) < n/MIN_RESAMPLE:
-                classes[c] = resample(classes[c], n_samples=n//AMT_RESAMPLE)
-            
-            # Additionally, if we want to undersample the majority class
-            # we do that as well
-            elif undersample and len(classes[c]) > n/MIN_RESAMPLE:
-                classes[c] = resample(
-                    classes[c], 
-                    n_samples=n//MIN_RESAMPLE,
-                    replace=False 
-                )
-                
-        # Put all of the newly sampled arrays together
-        ret = []
-        for ids in classes.values():
-            ret += ids
-            
-        return np.array(ret)
-        
-
     def generate_pyg_data(self, data): 
         has_feats = True
         ADD_GRAPH_FEATS = True
@@ -290,12 +229,20 @@ class Model:
         all_train_indices = data['train_indices']
         print("Num all training: %d" % len(all_train_indices))
         
+        '''
+        # Remove singletons
+        all_train = torch.zeros(num_nodes, dtype=torch.bool)
+        all_train[all_train_indices] = 1
+        all_train[graph_feats.reshape(graph_feats.size()[0]) == 0] = 0
+        all_train_indices = all_train.nonzero().numpy()
+        '''
+        
         # More intelligent split that keeps all classes in both splits,
         # and keeps the same distr of classes
         train_indices, val_indices = train_test_split(
             all_train_indices, 
             test_size=0.25,
-            stratify=y[inds].numpy(),
+            stratify=y[all_train_indices].numpy(),
             shuffle=True
         )
         
@@ -362,22 +309,21 @@ class Model:
         
         # Different algorithms for the number of hidden dims for each 
         if data.has_features:
-            hidden = min([int(max(data.y)+1) ** 2, 64])
+            hidden = min([int(max(data.y)+1) ** 2, 128])
             attn_heads = 'N/a'
         else:
             attn_heads = min([int(log(max(data.y)+1)) + 2, 8])
-            hidden = min([int(max(data.y)+1) ** 2, 32]) // attn_heads
+            hidden = (min([int(max(data.y)+1) ** 2, 32]) // attn_heads) + 1
             
         early_stopping=True
         val_patience = 100 # how long validation loss can increase before we stop
         
-        # Use normal NN if too many edges to handle
+        # Use heuristic-based hyperparams if too many edges to handle
         simplified = True if data.edge_index.size()[1] > 1e6 else False
-        simplified = False
         
         print('Hidden dimensions: %d' % hidden)
         print('Attention heads: %s' % str(attn_heads))
-        if not data.has_features or ADD_N2V or simplified:
+        if not data.has_features or ADD_N2V:
             # Requires at least len(class) dimensions, but give it a little more
             embedding_dim = 128 + int(avg_degree ** (1/2))
             
@@ -419,7 +365,10 @@ class Model:
                 data.x = embedder.embedding.weight
             
             # Remove reference to embedder to free up memory on GPU
-            del embedder 
+            del embedder
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache() 
         
         else:
             print('Num feature before: %d' % data.x.size()[1])
@@ -433,22 +382,52 @@ class Model:
              
         if data.has_features:
             print("Using GCN")
-            model = GCN(
-                features_num=data.x.size()[1],
-                num_class=int(max(data.y)) + 1, 
-                hidden=hidden, 
-                num_layers=num_layers
-            )
+            
+            # Just use heuristics-based 
+            if simplified:
+                params = {
+                    'features_num': data.x.size()[1],
+                    'num_class': int(max(data.y)) + 1,
+                    'hidden': hidden
+                }
+            
+            # Grid search to find best
+            else:
+                params = self.grid_search(
+                    data,
+                    hidden,
+                    h_dist=10,
+                    epochs=50,
+                    h_step=1
+                )
+            model = GCN(**params)
           
         else:
             print("Using GAT")
-            model = GAT(
-                features_num=data.x.size()[1], 
-                num_class=int(max(data.y)) + 1, 
-                hidden=hidden, 
-                num_layers=num_layers,
-                heads=attn_heads
-            )
+            
+            # Just use heuristics based 
+            if simplified:
+                params = {
+                    'features_num': data.x.size()[1],
+                    'num_class': int(max(data.y)) + 1,
+                    'hidden': hidden,
+                    'heads': attn_heads
+                }
+                
+            # Do grid search for best params
+            else:
+                params = self.grid_search(
+                    data,
+                    hidden,
+                    attn_heads=attn_heads,
+                    h_dist=10,
+                    h_step=1,
+                    a_dist=1,
+                    a_step=1,
+                    epochs=50
+                )
+                
+            model = GAT(**params)
 
         # Move data to compute device
         model = model.to(self.device)
@@ -456,7 +435,7 @@ class Model:
 
         # Configure optimizer
         lr = 0.005
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5, amsgrad=False)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
   
         # Main training loop
         min_loss = float('inf')
@@ -467,7 +446,7 @@ class Model:
         state_dict_save = 'checkpoint.model'
         
         # Fraction of patience before restarting with lower lr from best model
-        FRUSTRATION = 25
+        FRUSTRATION = 1 if data.has_features else 25
         # Number of times to retry training from prev best with lower lr
         NUM_REDOS = 15
         # Smallest value we allow loss to be, usually 5e-6
@@ -479,14 +458,14 @@ class Model:
         # goes down by more than that much. The hope is this balances for overfitting?
         # E.g., an epoch that increases val loss from 1 to 1.01 but decreases train loss
         # from 1 to 0.98 is considered the best model 
-        GOOD_ENOUGH = 1.0005
+        GOOD_ENOUGH = 1.00025
         BECOME_FRUSTRATED = False
         lr_decays = 0
         
         # LR must decay at least this many times before GOOD_ENOUGH training
         # is activated. This way we're sure it's in a local minimum before we
         # allow it to stray 
-        GOOD_ENOUGH_THRESH = 1
+        GOOD_ENOUGH_THRESH = 3
         
         epoch = 0
         while(True):
@@ -513,16 +492,16 @@ class Model:
             
             val_loss = loss.item()
             
-            print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
             if ((val_loss > val_loss_min and early_stopping) and 
                 not (BECOME_FRUSTRATED and val_loss <= GOOD_ENOUGH*val_loss_min and train_loss*GOOD_ENOUGH <= train_loss_min)):
                 val_increase+= 1
             else:
                 print("===New Minimum validation loss===")
+                print('[%d] Train loss: %.3f   Val Loss: %.3f' % (epoch, train_loss, val_loss))
                 val_loss_min = val_loss
                 train_loss_min = train_loss
                 val_increase=0
-                redos=0
+                redos=1
                 torch.save(model.state_dict(), state_dict_save)
             
             # Want to make sure we have the amount of time it takes
@@ -554,6 +533,14 @@ class Model:
                     model.load_state_dict(torch.load(state_dict_save))
                 
                 redos += 1
+                
+            # Use simple LR decay for data w features
+            elif data.has_features and epoch > 0 and epoch % 10 == 0 and lr > 5e-6:
+                lr -= 0.00025
+                lr = lr if lr > 5e-6 else 5e-6 # make sure not less than 5e-6
+                print('LR decay: New lr: %.6f' % lr)
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
             
             epoch += 1
             
@@ -581,6 +568,126 @@ class Model:
 
         return pred.cpu().numpy().flatten()
 
+    def grid_search(self, data, hidden, attn_heads=None, h_dist=10, 
+                    h_step=2, a_dist=0, a_step=0, epochs=15):
+        
+        # Best parameters for the model
+        best = {
+            'features_num': data.x.size()[1],
+            'num_class': int(max(data.y)) + 1
+        }
+        saved = 'best_params.model'
+        
+        if attn_heads:
+            attn_range = range(max(2, attn_heads-a_dist), attn_heads+a_dist+1, a_step)
+        else:
+            attn_range = range(1)
+        
+        # Want at least 4
+        hidden_range = range(max(4,hidden-h_dist), hidden+h_dist, h_step)
+        print('Hidden range: %s\nAttn Range: %s' % (str(list(hidden_range)), str(list(attn_range)) ))
+        
+        min_loss = float('inf')
+        data.to(self.device)
+        for h in hidden_range:
+            oom = False 
+            for a in attn_range:
+                lr = 0.005
+            
+                if attn_heads:
+                    model = GAT(
+                        features_num=data.x.size()[1],
+                        num_class=int(max(data.y)) + 1, 
+                        hidden=h,
+                        heads=a
+                    )
+                else:
+                    model = GCN(
+                        features_num=data.x.size()[1],
+                        num_class=int(max(data.y)) + 1, 
+                        hidden=h
+                    )
+                
+                optimizer = torch.optim.Adam(
+                    model.parameters(), 
+                    lr=lr, 
+                    weight_decay=1e-5
+                )
+                
+                model.to(self.device)
+                print("Testing %d hidden dims and %d attn heads" % (h,a))
+                
+                # Do short training
+                min_val_loss = float('inf')
+                for epoch in range(epochs):
+                    try: 
+                        model.train()
+                        optimizer.zero_grad()
+                        loss = F.nll_loss(
+                            model(data)[data.train_mask], 
+                            data.y[data.train_mask], 
+                            weight=data.weighted_loss
+                        )
+                        loss.backward()
+                        optimizer.step()
+                        
+                        # LR decay for GCN
+                        if not attn_heads and epoch > 0 and epoch % 10 == 0 and lr > 5e-6:
+                            lr -= 0.00025
+                            lr = lr if lr > 5e-6 else 5e-6 # make sure not less than 5e-6
+                            
+                            for g in optimizer.param_groups:
+                                g['lr'] = lr
+                                
+                        model.eval()
+                        loss = F.nll_loss(
+                            model(data)[data.val_mask], 
+                            data.y[data.val_mask],
+                            weight=data.weighted_loss
+                        )
+                        
+                        val_loss = loss.item()
+                        if val_loss < min_val_loss:
+                            min_val_loss = val_loss
+                                
+                                
+                    except RuntimeError as e:
+                        print(e)
+                        del model 
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        
+                        oom = True
+                    
+                    if oom:
+                        break
+                  
+                # If we rean out of memory, don't check any
+                # larger parameters      
+                if oom:
+                    break 
+                
+                # calculate loss on validation set
+                print("%d hidden\t%d attn heads\t%0.3f loss" % (h, a, min_val_loss))
+                if min_val_loss < min_loss:
+                    print("===New best params===")
+                    min_loss = min_val_loss
+                    best['hidden'] = h
+                    
+                    if attn_heads:
+                        best['heads'] = a
+                    
+                    
+                # Free as much memory as possible between models
+                del model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+        return best
+
+    
     def n2v_trainer(self, data, model, epochs=800, early_stopping=True, 
                     patience=10, verbosity=1, lr=0.01):
         
@@ -597,7 +704,7 @@ class Model:
         redos = 0
         
         # Fraction of patience before restarting with lower lr from best model
-        FRUSTRATION = 10
+        FRUSTRATION = 1 if data.has_features else 10
         # Number of times to retry training from prev best with lower lr
         NUM_REDOS = 25
         # Smallest value we allow loss to be, usually 5e-6
@@ -614,16 +721,12 @@ class Model:
             optimizer.step()
             epoch += 1
             
-            val_loss = loss.item()
-            
-            if verbosity >= 1:
-                print('[%d] Loss: %.3f' % (epoch, loss))
-            
             if loss > loss_min and early_stopping:
                 increase+= 1
             else:
                 if verbosity > 0:
                     print("===New Minimum loss===")
+                    print('[%d] Loss: %.3f' % (epoch, loss))
                 loss_min = loss
                 increase=0
                 redos=0
@@ -647,6 +750,14 @@ class Model:
                     redos = 0
                 
                 redos += 1
+                
+            # For data w features, use simple LR decay
+            elif data.has_features and epoch > 0 and epoch % 10 == 0 and lr > 5e-6:
+                lr -= 0.00025
+                lr = lr if lr > 5e-6 else 5e-6 # make sure not less than 5e-6
+                print('LR decay: New lr: %.6f' % lr)
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
             
                 
         if stopped_early:
@@ -655,8 +766,9 @@ class Model:
             
         return model
     
-    def var_thresh(self, x, var=0.00):
+    def var_thresh(self, x, var=0.0):
         sel = VarianceThreshold(var)
         
         x = torch.tensor(sel.fit_transform(x), dtype=torch.float)
         return x
+
