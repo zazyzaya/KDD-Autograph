@@ -312,7 +312,7 @@ class Model:
             hidden = min([int(max(data.y)+1) ** 2, 128])
             attn_heads = 'N/a'
         else:
-            attn_heads = min([int(log(max(data.y)+1)) + 2, 8])
+            attn_heads = min([int(log(max(data.y)+1)) + 2, 4])
             hidden = (min([int(max(data.y)+1) ** 2, 32]) // attn_heads) + 1
             
         early_stopping=True
@@ -383,23 +383,24 @@ class Model:
         if data.has_features:
             print("Using GCN")
             
+            # Make sure we actually need this.. Only if it crashes on test data
             # Just use heuristics-based 
-            if simplified:
-                params = {
-                    'features_num': data.x.size()[1],
-                    'num_class': int(max(data.y)) + 1,
-                    'hidden': hidden
-                }
+            #if simplified:
+            #    params = {
+            #        'features_num': data.x.size()[1],
+            #        'num_class': int(max(data.y)) + 1,
+            #        'hidden': hidden
+            #    }
             
             # Grid search to find best
-            else:
-                params = self.grid_search(
-                    data,
-                    hidden,
-                    h_dist=10,
-                    epochs=50,
-                    h_step=1
-                )
+            #else:
+            params = self.grid_search(
+                data,
+                hidden,
+                h_dist=10,
+                epochs=50,
+                h_step=1
+            )
             model = GCN(**params)
           
         else:
@@ -424,7 +425,7 @@ class Model:
                     h_step=1,
                     a_dist=1,
                     a_step=1,
-                    epochs=50
+                    epochs=25
                 )
                 
             model = GAT(**params)
