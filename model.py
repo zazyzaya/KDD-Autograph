@@ -47,11 +47,12 @@ def fix_seed(seed):
 fix_seed(1234)
 
 class GAT(torch.nn.Module):
-    def __init__(self, num_layers=2, hidden=8, features_num=16, num_class=2, heads=8):
+    def __init__(self, num_layers=2, hidden=8, features_num=16, num_class=2, heads=8, dropout=0.6):
         super(GAT, self).__init__()
         #self.lin1 = Linear(features_num, features_num//2)
         #self.lin2 = Linear(features_num//2, features_num//4)
         
+        self.dropout_p = dropout 
         self.conv1 = GATConv(features_num, hidden, heads=heads, dropout=0.6, concat=False)
         
         # On the Pubmed dataset, use heads=8 in conv2.
@@ -66,7 +67,7 @@ class GAT(torch.nn.Module):
         #x = F.dropout(x, p=0.6, training=self.training)
         
         x = F.elu(self.conv1(data.x, data.edge_index))
-        x = F.dropout(x, p=0.6, training=self.training)
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
         x = self.conv2(x, data.edge_index)
         return F.log_softmax(x, dim=1)
 
@@ -412,7 +413,8 @@ class Model:
                     'features_num': data.x.size()[1],
                     'num_class': int(max(data.y)) + 1,
                     'hidden': hidden,
-                    'heads': attn_heads
+                    'heads': attn_heads,
+                    'dropout': 0.7 # Increase dropout if complex graph
                 }
                 
             # Do grid search for best params
